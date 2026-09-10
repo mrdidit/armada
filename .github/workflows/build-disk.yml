@@ -172,7 +172,7 @@ jobs:
             output/armada-*.img.gz
             output/armada-*.img.gz.sha256
           if-no-files-found: error
-          retention-days: 1
+          retention-days: ${{ github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-aw99706-full-series-20260910' && 7 || 1 }}
           compression-level: 0
           overwrite: true
 
