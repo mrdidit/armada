@@ -82,14 +82,16 @@ jobs:
           # ubuntu-24.04 dropped these from the runner image; the build action,
           # validation, and push all need them.
           need=""
-          for t in buildah jq skopeo; do
+          for t in buildah jq skopeo openssl; do
             command -v "$t" >/dev/null || need="$need $t"
           done
           [ -z "$need" ] || { sudo apt-get update && sudo apt-get install -y $need; }
 
       - name: Check signing key
+        env:
+          SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
         run: |
-          if [ -z "${{ secrets.SIGNING_SECRET }}" ]; then
+          if [ -z "${SIGNING_SECRET}" ]; then
             echo "::error::SIGNING_SECRET is not set — refusing to publish an unsigned image (devices verify ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }})."
             exit 1
           fi
@@ -268,24 +270,48 @@ jobs:
         if: env.HAVE_SIGNING_SECRET == 'true'
         run: |
           set -euo pipefail
-          IMAGE_FULL="${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}"
-          IMAGE_REF="${IMAGE_FULL}@${{ steps.push.outputs.digest }}"
+          IMAGE_FULL="${IMAGE_REGISTRY}/${IMAGE_NAME}"
+          [[ "${IMAGE_DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]
+          IMAGE_REF="${IMAGE_FULL}@${IMAGE_DIGEST}"
+          signing_key=env://COSIGN_PRIVATE_KEY
+          if [ "${FORK_PEM_SIGNING}" = true ]; then
+            test "${IMAGE_FULL}" = ghcr.io/mrdidit/armada
+            umask 077
+            signing_dir=$(mktemp -d "${RUNNER_TEMP}/armada-signing.XXXXXX")
+            trap 'rm -rf -- "${signing_dir}"' EXIT
+            trap 'exit 1' HUP INT TERM
+            printf '%s\n' "${COSIGN_PRIVATE_KEY}" > "${signing_dir}/original.pem"
+            unset COSIGN_PRIVATE_KEY
+            export COSIGN_PASSWORD=''
+            cosign import-key-pair --key "${signing_dir}/original.pem" --output-key-prefix "${signing_dir}/imported"
+            openssl pkey -in "${signing_dir}/original.pem" -pubout -outform DER -out "${signing_dir}/original-public.der"
+            openssl pkey -pubin -in "${signing_dir}/imported.pub" -pubout -outform DER -out "${signing_dir}/imported-public.der"
+            cmp "${signing_dir}/original-public.der" "${signing_dir}/imported-public.der"
+            cp "${signing_dir}/imported.pub" "${RUNNER_TEMP}/aw99706-test-signing.pub"
+            signing_key="${signing_dir}/imported.key"
+          fi
           # Cosign and Skopeo use separate registry auth stores.
-          echo "${{ secrets.GITHUB_TOKEN }}" | cosign login ghcr.io -u "${{ github.actor }}" --password-stdin
+          printf '%s' "${REGISTRY_TOKEN}" | cosign login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
           # Sign the digest, not a tag (a concurrent run could re-point the tag).
           # --new-bundle-format=false: bootc's verifier expects the legacy .sig; the
           # default flips in cosign v3.
-          cosign sign -y --new-bundle-format=false --key env://COSIGN_PRIVATE_KEY "${IMAGE_REF}"
+          cosign sign -y --new-bundle-format=false --key "${signing_key}" "${IMAGE_REF}"
 
           # Legacy-hosted images also need the canonical identity required by bridge policy.
           if [ "${IMAGE_FULL}" = "${ARMADA_LEGACY_IMAGE}" ]; then
             cosign sign -y --new-bundle-format=false \
-              --key env://COSIGN_PRIVATE_KEY \
+              --key "${signing_key}" \
               --sign-container-identity "${ARMADA_CANONICAL_IMAGE}" \
               "${IMAGE_REF}"
           fi
 
-          if [ "${{ github.event.repository.fork }}" != "true" ]; then
+          if [ "${FORK_PEM_SIGNING}" = true ]; then
+            cosign verify --key "${signing_dir}/imported.pub" "${IMAGE_REF}" > "${RUNNER_TEMP}/armada-signature.json"
+            jq -e --arg digest "${IMAGE_DIGEST}" --arg image "${IMAGE_FULL}" \
+              'any(.[]; .critical.image["docker-manifest-digest"] == $digest
+                 and .critical.identity["docker-reference"] == $image)' \
+              "${RUNNER_TEMP}/armada-signature.json"
+          elif [ "${{ github.event.repository.fork }}" != "true" ]; then
             cosign verify --key system_files/etc/pki/containers/armada.pub "${IMAGE_REF}"
             if [ "${IMAGE_FULL}" = "${ARMADA_LEGACY_IMAGE}" ]; then
               cosign verify --check-claims=false \
@@ -300,6 +326,9 @@ jobs:
           TAGS: ${{ steps.push.outputs.digest }}
           COSIGN_EXPERIMENTAL: false
           COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+          FORK_PEM_SIGNING: ${{ github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-aw99706-monorepo-20260920' }}
 
       - name: Publish channel tags
         if: env.HAVE_SIGNING_SECRET == 'true'
@@ -326,6 +355,29 @@ jobs:
           } >> "${GITHUB_STEP_SUMMARY}"
         env:
           HAVE_SIGNING_SECRET: ${{ secrets.SIGNING_SECRET != '' }}
+
+      - name: Save test build information
+        if: github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-aw99706-monorepo-20260920'
+        env:
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+          SOURCE_REVISION: ${{ steps.version.outputs.revision }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/aw99706-build-info"
+          cp "${RUNNER_TEMP}/aw99706-test-signing.pub" "${RUNNER_TEMP}/aw99706-build-info/"
+          cp "${RUNNER_TEMP}/package-refs.env" "${RUNNER_TEMP}/aw99706-build-info/"
+          jq -n --arg image "${IMAGE_REGISTRY}/${IMAGE_NAME}@${IMAGE_DIGEST}" \
+            --arg revision "${SOURCE_REVISION}" \
+            '{image: $image, revision: $revision}' > "${RUNNER_TEMP}/aw99706-build-info/build.json"
+
+      - name: Upload test build information
+        if: github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-aw99706-monorepo-20260920'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aw99706-build-info
+          path: ${{ runner.temp }}/aw99706-build-info/
+          if-no-files-found: error
+          retention-days: 30
 
   publish_disk:
     name: Disk image

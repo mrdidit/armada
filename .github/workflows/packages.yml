@@ -38,6 +38,7 @@ jobs:
         id: resolve
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REUSE_UPSTREAM_PACKAGES: ${{ github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-aw99706-monorepo-20260920' }}
         run: |
           set -euo pipefail
           owner="${{ github.repository_owner }}"
@@ -61,6 +62,10 @@ jobs:
 
             if skopeo inspect --raw "docker://${ref}" >/dev/null 2>&1; then
               echo "::notice::${pkg} already built (${hash})"
+            elif [ "${REUSE_UPSTREAM_PACKAGES}" = true ] && [ "${pkg}" != kernel ] &&
+                skopeo inspect --raw "docker://ghcr.io/armada-os/armada/pkg/${pkg}:${hash}" >/dev/null 2>&1; then
+              ref="ghcr.io/armada-os/armada/pkg/${pkg}:${hash}"
+              echo "::notice::${pkg} already built upstream (${hash})"
             else
               echo "::notice::${pkg} needs building (${hash})"
               matrix="$(jq -c --arg p "${pkg}" --arg r "${runner}" --arg h "${hash}" \
