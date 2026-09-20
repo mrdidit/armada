@@ -117,17 +117,15 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armada
   upstream: local
   notes: Armada adds compatibility for existing flat fixed-5-V nodes; child-regulator nodes use the Linux 7.2 upstream behavior unchanged.
+- `patches/0055-backlight-aw99706-upstream-fixes.patch`
+  source: https://github.com/torvalds/linux/compare/ce6fc04113241c82a698f362f8dc6e1cc2f65448...fbf8b5d251e8b4e1b01c591be313c63cb9e1526a.patch
+  upstream: https://lore.kernel.org/r/20260804030255.1934470-2-junjie.cao@intel.com
+  notes: Junjie Cao's complete three-patch series, preserved verbatim with original authorship, messages and trailers: daf120e464386f750b3870dc04d5bc6a786f0000 (property names), 3d142b19b09ea62d6e9a33d46d1b858b3ad05707 (value validation), and fbf8b5d251e8b4e1b01c591be313c63cb9e1526a (blank state). Replaces the carried 0062 and 0065 patches; corrects attribution from armada-os/armada-packages#37.
 - `patches/0056-backlight-aw99706-enable-hwen-before-chip-id-read.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8750/patches/linux/0056-backlight-aw99706-enable-hwen-before-chip-id-read.patch
   upstream: unknown
 - `patches/0057-backlight-aw99706-konkr-cfg7.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8750/patches/linux/0057-backlight-aw99706-konkr-cfg7.patch
-  upstream: unknown
-- `patches/0062-backlight-aw99706-honor-blank-power-state.patch`
-  source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8750/patches/linux/0062-backlight-aw99706-honor-blank-power-state.patch
-  upstream: unknown
-- `patches/0065-backlight-aw99706-use-dt-binding-property-names.patch`
-  source: https://github.com/mrdidit/distribution/blob/b14788a72b7399f03aad2cdcced2e3b91ae15810/projects/ROCKNIX/devices/SM8750/patches/linux/0065-backlight-aw99706-use-dt-binding-property-names.patch
   upstream: unknown
 - `patches/0066-regulator-add-qcom-pm8150l-lcdb.patch`
   source: https://github.com/ROCKNIX/distribution/blob/807c74fc46c124891d8aa9b57a68533d38e9a6b2/projects/ROCKNIX/devices/SM8250/patches/linux/0066-regulator-add-qcom-pm8150l-lcdb.patch

@@ -34,10 +34,9 @@
 0060-backlight-Add-SY7758-LED-driver.patch
 0060-dt-bindings-silergy-sy7758.patch
 0054-regulator-add-sgm3804-i2c-regulator-for-panel-power-.patch
+0055-backlight-aw99706-upstream-fixes.patch
 0056-backlight-aw99706-enable-hwen-before-chip-id-read.patch
 0057-backlight-aw99706-konkr-cfg7.patch
-0062-backlight-aw99706-honor-blank-power-state.patch
-0065-backlight-aw99706-use-dt-binding-property-names.patch
 0066-regulator-add-qcom-pm8150l-lcdb.patch
 
 # ============== Touchscreen ==============
