@@ -1,28 +1,24 @@
 ---
-name: Build images
+name: Build KPFE charging test update
 on:
-  push:
-    branches:
-      - main
-      - staging
   workflow_dispatch:
 
 env:
   ARMADA_CANONICAL_IMAGE: "ghcr.io/armada-os/armada"
   ARMADA_LEGACY_IMAGE: "ghcr.io/virtudude/armada"
-  BASE_IMAGE: "quay.io/fedora/fedora-bootc:44"
-  IMAGE_DESC: "Armada: a gaming-focused, SteamOS-like Fedora bootc image for ARM64 handhelds"
+  BASE_IMAGE: "ghcr.io/mrdidit/armada@sha256:8dc90f1af081bde316beaac10905e9d50dbf7fff93d559c2271c0d77237da3ba"
+  IMAGE_DESC: "Armada KPFE charge-policy test, retaining the installed userspace and backlight baseline"
   IMAGE_NAME: "${{ github.event.repository.name }}"
   IMAGE_REGISTRY: "ghcr.io/${{ github.repository_owner }}"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
-  queue: max
 
 jobs:
   packages:
     name: Packages
+    if: github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-kpfe-charge-policy-20260921'
     permissions:
       contents: read
       packages: write
@@ -61,6 +57,7 @@ jobs:
             exit 1
           fi
           branch="${BUILD_REF#refs/heads/}"
+          test "${branch}" = test-kpfe-charge-policy-20260921
           case "${branch}" in
             main) tag=testing; channel=preview ;;
             staging) tag=staging; channel=staging ;;
@@ -121,9 +118,9 @@ jobs:
             org.opencontainers.image.revision=${{ steps.version.outputs.revision }}
             org.opencontainers.image.created=${{ steps.version.outputs.created }}
             org.opencontainers.image.description=${{ env.IMAGE_DESC }}
-            org.opencontainers.image.documentation=https://raw.githubusercontent.com/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}/${{ steps.version.outputs.revision }}/README.md
+            org.opencontainers.image.documentation=https://raw.githubusercontent.com/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}/${{ steps.version.outputs.revision }}/docs/KPFE-CHARGING-TEST.md
             org.opencontainers.image.licenses=GPL-2.0-or-later
-            org.opencontainers.image.source=https://github.com/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}/blob/${{ steps.version.outputs.revision }}/Containerfile
+            org.opencontainers.image.source=https://github.com/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}/blob/${{ steps.version.outputs.revision }}/Containerfile.charging-test
             org.opencontainers.image.title=${{ env.IMAGE_NAME }}
             org.opencontainers.image.url=https://github.com/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}/tree/${{ steps.version.outputs.revision }}
             org.opencontainers.image.vendor=${{ github.repository_owner }}
@@ -140,7 +137,10 @@ jobs:
           set -euo pipefail
           base_digest=$(skopeo inspect --override-arch arm64 --format '{{.Digest}}' \
             "docker://${BASE_IMAGE}")
-          base_image="${BASE_IMAGE%:*}@${base_digest}"
+          test "${BASE_IMAGE}" = "ghcr.io/mrdidit/armada@${base_digest}"
+          base_image="${BASE_IMAGE}"
+          skopeo inspect --override-arch arm64 --config "docker://${base_image}" |
+            jq -e '.architecture == "arm64" and .os == "linux"'
           config=$(skopeo inspect --override-arch arm64 --config \
             "docker://${base_image}" |
             jq -c --argjson metadata "${METADATA_JSON}" '
@@ -157,15 +157,19 @@ jobs:
           BUILD_ARGS: ${{ needs.packages.outputs.build_args }}
         run: |
           set -euo pipefail
-          # One <PKG>_REF=<image> line per package, from the Packages workflow.
-          # Unchanged packages resolve to an image built by an earlier run.
           printf '%s' "${BUILD_ARGS}" > "${RUNNER_TEMP}/package-refs.env"
-          expected=$(grep -c '^ARG [A-Z0-9_]*_REF$' Containerfile)
+          expected=$(grep -c '^ARG [A-Z0-9_]*_REF$' Containerfile.charging-test)
           got=$(grep -c '_REF=' "${RUNNER_TEMP}/package-refs.env")
           if [ "${expected}" -ne "${got}" ]; then
-            echo "::error::Containerfile wants ${expected} package refs, resolver gave ${got}"
+            echo "::error::Test Containerfile wants ${expected} package refs, resolver gave ${got}"
             exit 1
           fi
+          test "${got}" -eq 1
+          grep -Eq '^KERNEL_REF=ghcr.io/mrdidit/armada/pkg/kernel:[a-f0-9]{32}$' "${RUNNER_TEMP}/package-refs.env"
+          kernel_ref=$(cut -d= -f2- "${RUNNER_TEMP}/package-refs.env")
+          kernel_digest=$(skopeo inspect --format '{{.Digest}}' "docker://${kernel_ref}")
+          [[ "${kernel_digest}" =~ ^sha256:[a-f0-9]{64}$ ]]
+          printf 'KERNEL_REF=%s@%s\n' "${kernel_ref%:*}" "${kernel_digest}" > "${RUNNER_TEMP}/package-refs.env"
           echo "Resolved ${got} package refs:" && cat "${RUNNER_TEMP}/package-refs.env"
 
       - name: Require native OverlayFS
@@ -179,7 +183,7 @@ jobs:
         uses: redhat-actions/buildah-build@719e3c40d8af9790c23eca13f7daa339f2867034 # v3.1.0
         with:
           containerfiles: |
-            ./Containerfile
+            ./Containerfile.charging-test
           image: ${{ env.IMAGE_NAME }}
           tags: build-output
           labels: ${{ steps.metadata.outputs.labels }}
@@ -287,7 +291,7 @@ jobs:
             openssl pkey -in "${signing_dir}/original.pem" -pubout -outform DER -out "${signing_dir}/original-public.der"
             openssl pkey -pubin -in "${signing_dir}/imported.pub" -pubout -outform DER -out "${signing_dir}/imported-public.der"
             cmp "${signing_dir}/original-public.der" "${signing_dir}/imported-public.der"
-            cp "${signing_dir}/imported.pub" "${RUNNER_TEMP}/aw99706-test-signing.pub"
+            cp "${signing_dir}/imported.pub" "${RUNNER_TEMP}/kpfe-charge-policy-test-signing.pub"
             signing_key="${signing_dir}/imported.key"
           fi
           # Cosign and Skopeo use separate registry auth stores.
@@ -328,7 +332,7 @@ jobs:
           COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
-          FORK_PEM_SIGNING: ${{ github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-aw99706-monorepo-20260920' }}
+          FORK_PEM_SIGNING: ${{ github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-kpfe-charge-policy-20260921' }}
 
       - name: Publish channel tags
         if: env.HAVE_SIGNING_SECRET == 'true'
@@ -357,25 +361,27 @@ jobs:
           HAVE_SIGNING_SECRET: ${{ secrets.SIGNING_SECRET != '' }}
 
       - name: Save test build information
-        if: github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-aw99706-monorepo-20260920'
+        if: github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-kpfe-charge-policy-20260921'
         env:
           IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
           SOURCE_REVISION: ${{ steps.version.outputs.revision }}
         run: |
           set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/aw99706-build-info"
-          cp "${RUNNER_TEMP}/aw99706-test-signing.pub" "${RUNNER_TEMP}/aw99706-build-info/"
-          cp "${RUNNER_TEMP}/package-refs.env" "${RUNNER_TEMP}/aw99706-build-info/"
+          mkdir -p "${RUNNER_TEMP}/kpfe-charge-policy-build-info"
+          cp "${RUNNER_TEMP}/kpfe-charge-policy-test-signing.pub" "${RUNNER_TEMP}/kpfe-charge-policy-build-info/"
+          cp "${RUNNER_TEMP}/package-refs.env" "${RUNNER_TEMP}/armada-signature.json" "${RUNNER_TEMP}/kpfe-charge-policy-build-info/"
+          sha256sum packages/kernel/patches/0950-power-supply-qcom-battmgr-kpfe-charge-policy.patch > "${RUNNER_TEMP}/kpfe-charge-policy-build-info/patch.sha256"
           jq -n --arg image "${IMAGE_REGISTRY}/${IMAGE_NAME}@${IMAGE_DIGEST}" \
             --arg revision "${SOURCE_REVISION}" \
-            '{image: $image, revision: $revision}' > "${RUNNER_TEMP}/aw99706-build-info/build.json"
+            --arg base "${BASE_IMAGE}" \
+            '{image: $image, revision: $revision, base: $base, scope: "kernel-only test update"}' > "${RUNNER_TEMP}/kpfe-charge-policy-build-info/build.json"
 
       - name: Upload test build information
-        if: github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-aw99706-monorepo-20260920'
+        if: github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-kpfe-charge-policy-20260921'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: aw99706-build-info
-          path: ${{ runner.temp }}/aw99706-build-info/
+          name: kpfe-charge-policy-build-info
+          path: ${{ runner.temp }}/kpfe-charge-policy-build-info/
           if-no-files-found: error
           retention-days: 30
 

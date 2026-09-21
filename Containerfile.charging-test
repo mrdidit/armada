@@ -1,0 +1,49 @@
+ARG CHUNKAH_IMAGE=quay.io/coreos/chunkah@sha256:ff8b8b466a942ec6000445d4001fc661e2fc5a952ad9ee29b4de9ab09d1d1708
+ARG BASE_IMAGE=ghcr.io/mrdidit/armada@sha256:8dc90f1af081bde316beaac10905e9d50dbf7fff93d559c2271c0d77237da3ba
+
+ARG KERNEL_REF
+FROM ${KERNEL_REF} AS kernel
+
+FROM scratch AS ctx
+COPY build_files/20-install-kernel.sh build_files/52-configure-os-release.sh build_files/55-generate-initramfs.sh /build_files/
+COPY system_files/usr/lib/firmware /system_files/usr/lib/firmware/
+
+FROM ${BASE_IMAGE} AS armada-rootfs
+ARG ARMADA_VERSION=unknown
+LABEL org.opencontainers.image.version="${ARMADA_VERSION}"
+
+RUN --network=none \
+    --mount=type=bind,from=ctx,source=/,target=/ctx \
+    --mount=type=bind,from=kernel,source=/kernel,target=/packages/kernel \
+    --mount=type=cache,dst=/var/cache \
+    --mount=type=cache,dst=/var/log \
+    --mount=type=tmpfs,dst=/tmp \
+    rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' >/tmp/rpms-before && \
+    mkdir -p /usr/lib/armada && \
+    printf '%s\n' "${ARMADA_VERSION}" >/usr/lib/armada/version && \
+    /ctx/build_files/20-install-kernel.sh && \
+    /ctx/build_files/52-configure-os-release.sh && \
+    /ctx/build_files/55-generate-initramfs.sh && \
+    rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' >/tmp/rpms-after && \
+    sort -o /tmp/rpms-before /tmp/rpms-before && \
+    sort -o /tmp/rpms-after /tmp/rpms-after && \
+    cmp /tmp/rpms-before /tmp/rpms-after
+
+RUN bootc container lint
+
+FROM ${CHUNKAH_IMAGE} AS chunkah
+ARG CHUNKAH_CONFIG_STR
+RUN --mount=from=armada-rootfs,target=/chunkah,ro \
+    /bin/bash -o pipefail -c ' \
+        set -e; \
+        start=${SECONDS}; \
+        chunkah build --verbose --compressed --compression-level 6 \
+            --arch arm64 --max-layers 128 --source-date-epoch 0 \
+            --prune /sysroot/ \
+            --label ostree.commit- --label ostree.final-diffid- \
+            --config-str "${CHUNKAH_CONFIG_STR}" \
+            --output oci:/run/src/chunked 2>&1 | tee /run/src/chunkah.log; \
+        echo "Chunkah completed in $((SECONDS - start)) seconds" \
+    '
+
+FROM armada-rootfs AS armada
