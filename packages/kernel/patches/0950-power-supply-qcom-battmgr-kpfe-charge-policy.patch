@@ -1,0 +1,1405 @@
+From: mrdidit <26687854+mrdidit@users.noreply.github.com>
+Subject: [PATCH] power: supply: qcom_battmgr: scope KPFE charge policy to Armada
+
+Extract the battery property-29 command, precise device scoping and
+fail-safe attach/restart re-arm lifecycle from the ROCKNIX
+0518/0520/0522 changes. Keep USB supplies read-only; no PPS, input-
+current or external-pump controls.
+
+Use immutable exact-root and PMIC-GLINK match data. Correlate the
+available opcode/property fields, reject malformed replies and
+preserve transport errors. The firmware's property-29 SET ACK does not
+define value or result; untagged same-property late replies still
+require a bounded quiet drain. Keep requested charge_behaviour
+separate from observed telemetry.
+
+Return threshold RPC errors and serialize their cache updates.
+Preserve Armada's existing charge-unit and charge-now changes.
+
+Derived from mrdidit/distribution
+cda2efe728dca5c788851c79bfde121190bfd3ed: 0518, scoping only from
+0520, and 0522. Original author: mrdidit. The target driver remains
+GPL-2.0-only with its original copyright notices. Prepared against
+Armada 6027251e6c087d18433f0d1b0731b514ff217a25 (7.2.3). This is a
+review candidate, not evidence of Armada hardware validation.
+
+---
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -9,6 +9,8 @@
+ #include <linux/mutex.h>
+ #include <linux/nvmem-consumer.h>
+ #include <linux/of_device.h>
++#include <linux/jiffies.h>
++#include <linux/of.h>
+ #include <linux/power_supply.h>
+ #include <linux/property.h>
+ #include <linux/soc/qcom/pdr.h>
+@@ -24,6 +26,13 @@
+ 	QCOM_BATTMGR_SM8350,
+ 	QCOM_BATTMGR_SM8550,
+ 	QCOM_BATTMGR_X1E80100,
++};
++
++enum qcom_battmgr_kpfe_rearm_state {
++	KPFE_REARM_IDLE,
++	KPFE_REARM_PREPARE,
++	KPFE_REARM_DISABLE_ONLY,
++	KPFE_REARM_RECONCILE,
+ };
+ 
+ #define BATTMGR_BAT_STATUS		0x1
+@@ -74,6 +83,8 @@
+ #define BATT_CHG_CTRL_START_THR		25
+ #define BATT_CHG_CTRL_END_THR		26
+ 
++#define BATT_ONLINE			29
++
+ #define BATTMGR_USB_PROPERTY_GET	0x32
+ #define BATTMGR_USB_PROPERTY_SET	0x33
+ #define USB_ONLINE			0
+@@ -86,6 +97,13 @@
+ #define USB_ADAP_TYPE			7
+ #define USB_MOISTURE_DET_EN		8
+ #define USB_MOISTURE_DET_STS		9
++
++#define KPFE_BYPASS_REARM_DELAY_MS	2000
++#define KPFE_BYPASS_RETRY_MS		250
++#define KPFE_BYPASS_RETRY_TIMEOUT_MS	5000
++#define KPFE_BYPASS_SLOW_RETRY_MS	5000
++#define KPFE_BYPASS_ACK_DRAIN_MS	1000
++#define KPFE_BYPASS_ACK_DRAIN_MAX	2
+ 
+ #define BATTMGR_WLS_PROPERTY_GET	0x34
+ #define BATTMGR_WLS_PROPERTY_SET	0x35
+@@ -248,6 +266,7 @@
+ 	bool valid;
+ 
+ 	bool present;
++	bool online;
+ 	unsigned int charge_type;
+ 	unsigned int design_capacity;
+ 	unsigned int last_full_capacity;
+@@ -307,11 +326,18 @@
+ 	unsigned int current_max;
+ };
+ 
++struct qcom_battmgr_device_data {
++	const char *root_compatible;
++	const char *glink_compatible;
++	const struct power_supply_desc *battery_desc;
++};
++
+ struct qcom_battmgr {
+ 	struct device *dev;
+ 	struct pmic_glink_client *client;
+ 
+ 	enum qcom_battmgr_variant variant;
++	const struct qcom_battmgr_device_data *device_data;
+ 
+ 	struct power_supply *ac_psy;
+ 	struct power_supply *bat_psy;
+@@ -324,6 +350,7 @@
+ 	struct completion ack;
+ 
+ 	bool service_up;
++	bool shutting_down;
+ 
+ 	struct qcom_battmgr_info info;
+ 	struct qcom_battmgr_status status;
+@@ -332,32 +359,125 @@
+ 	struct qcom_battmgr_wireless wireless;
+ 
+ 	struct work_struct enable_work;
++	struct work_struct kpfe_charge_work;
++	struct delayed_work kpfe_charge_rearm_work;
+ 
+ 	/*
+ 	 * @lock is used to prevent concurrent power supply requests to the
+ 	 * firmware, as it then stops responding.
+ 	 */
+ 	struct mutex lock;
+-};
+-
+-static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t len)
+-{
++
++	enum power_supply_charge_behaviour kpfe_charge_behaviour;
++	bool kpfe_ack_tainted;
++	bool kpfe_request_active;
++	bool kpfe_draining;
++	u32 kpfe_expected_opcode;
++	u32 kpfe_expected_property;
++	bool kpfe_usb_online;
++	bool kpfe_usb_online_valid;
++	enum qcom_battmgr_kpfe_rearm_state kpfe_rearm_state;
++	bool kpfe_rearm_pulse_confirmed;
++	bool kpfe_rearm_prepare_after_reconcile;
++	unsigned long kpfe_rearm_not_before;
++	unsigned long kpfe_rearm_fast_deadline;
++	u32 kpfe_rearm_service_gen;
++	u32 kpfe_ready_service_gen;
++	atomic_t kpfe_service_gen;
++};
++
++static int qcom_battmgr_request_once(struct qcom_battmgr *battmgr, void *data,
++				     size_t len)
++{
++	const struct qcom_battmgr_property_request *request = data;
+ 	unsigned long left;
++	u32 service_gen = (u32)atomic_read(&battmgr->kpfe_service_gen);
+ 	int ret;
+ 
++	if (READ_ONCE(battmgr->shutting_down) || !READ_ONCE(battmgr->client))
++		return -ESHUTDOWN;
++	if (battmgr->device_data &&
++	    READ_ONCE(battmgr->kpfe_ack_tainted))
++		return -EUCLEAN;
++	if (!READ_ONCE(battmgr->service_up))
++		return -EAGAIN;
++
+ 	reinit_completion(&battmgr->ack);
+ 
+ 	battmgr->error = 0;
++	if (battmgr->device_data) {
++		battmgr->kpfe_expected_opcode = le32_to_cpu(request->hdr.opcode);
++		battmgr->kpfe_expected_property = U32_MAX;
++		if (battmgr->kpfe_expected_opcode == BATTMGR_BAT_PROPERTY_GET ||
++		    battmgr->kpfe_expected_opcode == BATTMGR_BAT_PROPERTY_SET ||
++		    battmgr->kpfe_expected_opcode == BATTMGR_USB_PROPERTY_GET ||
++		    battmgr->kpfe_expected_opcode == BATTMGR_WLS_PROPERTY_GET)
++			battmgr->kpfe_expected_property = le32_to_cpu(request->property);
++		/* Publish reply fields before the receive callback consumes them. */
++		smp_store_release(&battmgr->kpfe_request_active, true);
++	}
+ 
+ 	ret = pmic_glink_send(battmgr->client, data, len);
+ 	if (ret < 0)
+-		return ret;
++		goto out;
+ 
+ 	left = wait_for_completion_timeout(&battmgr->ack, HZ);
+-	if (!left)
+-		return -ETIMEDOUT;
+-
+-	return battmgr->error;
++	ret = left ? battmgr->error : -ETIMEDOUT;
++	if (!ret && battmgr->device_data &&
++	    (!READ_ONCE(battmgr->service_up) ||
++	     service_gen != (u32)atomic_read(&battmgr->kpfe_service_gen)))
++		ret = -EAGAIN;
++
++out:
++	if (battmgr->device_data)
++		WRITE_ONCE(battmgr->kpfe_request_active, false);
++	return ret;
++}
++
++static int qcom_battmgr_drain_ack(struct qcom_battmgr *battmgr,
++				  unsigned long timeout,
++				  unsigned int max_responses)
++{
++	unsigned long left;
++	unsigned int drained;
++
++	WRITE_ONCE(battmgr->kpfe_draining, true);
++	/*
++	 * Firmware responses carry no token. Restart a full quiet interval after
++	 * each expected late ACK instead of trusting the first completion.
++	 */
++	for (drained = 0; drained <= max_responses; drained++) {
++		reinit_completion(&battmgr->ack);
++		left = wait_for_completion_timeout(&battmgr->ack, timeout);
++		if (!left) {
++			WRITE_ONCE(battmgr->kpfe_draining, false);
++			return 0;
++		}
++	}
++
++	reinit_completion(&battmgr->ack);
++	WRITE_ONCE(battmgr->kpfe_ack_tainted, true);
++	WRITE_ONCE(battmgr->kpfe_draining, false);
++	return -EOVERFLOW;
++}
++
++static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data,
++				size_t len)
++{
++	int drain_ret;
++	int ret;
++
++	ret = qcom_battmgr_request_once(battmgr, data, len);
++	if (ret == -ETIMEDOUT && battmgr->device_data) {
++		drain_ret = qcom_battmgr_drain_ack(battmgr, HZ, 1);
++		if (drain_ret) {
++			dev_err_ratelimited(battmgr->dev,
++					    "too many late KPFE firmware responses\n");
++			return drain_ret;
++		}
++	}
++
++	return ret;
+ }
+ 
+ static int qcom_battmgr_request_property(struct qcom_battmgr *battmgr, int opcode,
+@@ -375,6 +495,22 @@
+ 	return qcom_battmgr_request(battmgr, &request, sizeof(request));
+ }
+ 
++static int qcom_battmgr_request_property_once(struct qcom_battmgr *battmgr,
++					      int opcode, int property,
++					      u32 value)
++{
++	struct qcom_battmgr_property_request request = {
++		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
++		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
++		.hdr.opcode = cpu_to_le32(opcode),
++		.battery = cpu_to_le32(0),
++		.property = cpu_to_le32(property),
++		.value = cpu_to_le32(value),
++	};
++
++	return qcom_battmgr_request_once(battmgr, &request, sizeof(request));
++}
++
+ static int qcom_battmgr_update_status(struct qcom_battmgr *battmgr)
+ {
+ 	struct qcom_battmgr_update_request request = {
+@@ -430,6 +566,7 @@
+ 	[POWER_SUPPLY_PROP_HEALTH] = BATT_HEALTH,
+ 	[POWER_SUPPLY_PROP_PRESENT] = BATT_PRESENT,
+ 	[POWER_SUPPLY_PROP_CHARGE_TYPE] = BATT_CHG_TYPE,
++	[POWER_SUPPLY_PROP_ONLINE] = BATT_ONLINE,
+ 	[POWER_SUPPLY_PROP_CAPACITY] = BATT_CAPACITY,
+ 	[POWER_SUPPLY_PROP_VOLTAGE_OCV] = BATT_VOLT_OCV,
+ 	[POWER_SUPPLY_PROP_VOLTAGE_NOW] = BATT_VOLT_NOW,
+@@ -520,6 +657,19 @@
+ 	if (!battmgr->service_up)
+ 		return -EAGAIN;
+ 
++	if (!battmgr->device_data &&
++	    (psp == POWER_SUPPLY_PROP_ONLINE ||
++	     psp == POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR))
++		return -EINVAL;
++	if (battmgr->device_data &&
++	    psp == POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR) {
++		mutex_lock(&battmgr->lock);
++		val->intval = battmgr->kpfe_charge_behaviour;
++		mutex_unlock(&battmgr->lock);
++
++		return 0;
++	}
++
+ 	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
+ 	    battmgr->variant == QCOM_BATTMGR_X1E80100)
+ 		ret = qcom_battmgr_bat_sc8280xp_update(battmgr, psp);
+@@ -528,9 +678,22 @@
+ 	if (ret < 0)
+ 		return ret;
+ 
++	if (psp == POWER_SUPPLY_PROP_STATUS &&
++	    battmgr->device_data) {
++		ret = qcom_battmgr_bat_sm8350_update(battmgr,
++						     POWER_SUPPLY_PROP_ONLINE);
++		if (ret < 0)
++			return ret;
++	}
++
+ 	switch (psp) {
+ 	case POWER_SUPPLY_PROP_STATUS:
+-		val->intval = battmgr->status.status;
++		if (battmgr->device_data &&
++		    !battmgr->info.online &&
++		    battmgr->status.status == POWER_SUPPLY_STATUS_CHARGING)
++			val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
++		else
++			val->intval = battmgr->status.status;
+ 		break;
+ 	case POWER_SUPPLY_PROP_CHARGE_TYPE:
+ 		val->intval = battmgr->info.charge_type;
+@@ -540,6 +703,9 @@
+ 		break;
+ 	case POWER_SUPPLY_PROP_PRESENT:
+ 		val->intval = battmgr->info.present;
++		break;
++	case POWER_SUPPLY_PROP_ONLINE:
++		val->intval = battmgr->info.online;
+ 		break;
+ 	case POWER_SUPPLY_PROP_TECHNOLOGY:
+ 		val->intval = battmgr->info.technology;
+@@ -680,6 +846,7 @@
+ 	int ret;
+ 
+ 	start_soc = clamp(start_soc, CHARGE_CTRL_START_THR_MIN, CHARGE_CTRL_START_THR_MAX);
++	mutex_lock(&battmgr->lock);
+ 
+ 	/*
+ 	 * If the new start threshold is larger than the old end threshold,
+@@ -696,15 +863,14 @@
+ 		delta_soc = battmgr->info.charge_ctrl_end - start_soc;
+ 	}
+ 
+-	mutex_lock(&battmgr->lock);
+ 	ret = qcom_battmgr_set_charge_control(battmgr, target_soc, delta_soc);
+-	mutex_unlock(&battmgr->lock);
+ 	if (!ret) {
+ 		battmgr->info.charge_ctrl_start = start_soc;
+ 		battmgr->info.charge_ctrl_end = target_soc;
+ 	}
+-
+-	return 0;
++	mutex_unlock(&battmgr->lock);
++
++	return ret;
+ }
+ 
+ static int qcom_battmgr_set_charge_end_threshold(struct qcom_battmgr *battmgr, int end_soc)
+@@ -713,19 +879,19 @@
+ 	int ret;
+ 
+ 	end_soc = clamp(end_soc, CHARGE_CTRL_END_THR_MIN, CHARGE_CTRL_END_THR_MAX);
++	mutex_lock(&battmgr->lock);
+ 
+ 	if (battmgr->info.charge_ctrl_start && end_soc > battmgr->info.charge_ctrl_start)
+ 		delta_soc = end_soc - battmgr->info.charge_ctrl_start;
+ 
+-	mutex_lock(&battmgr->lock);
+ 	ret = qcom_battmgr_set_charge_control(battmgr, end_soc, delta_soc);
+-	mutex_unlock(&battmgr->lock);
+ 	if (!ret) {
+ 		battmgr->info.charge_ctrl_start = end_soc - delta_soc;
+ 		battmgr->info.charge_ctrl_end = end_soc;
+ 	}
+-
+-	return 0;
++	mutex_unlock(&battmgr->lock);
++
++	return ret;
+ }
+ 
+ static int qcom_battmgr_charge_control_thresholds_init(struct qcom_battmgr *battmgr)
+@@ -760,7 +926,11 @@
+ static int qcom_battmgr_bat_is_writeable(struct power_supply *psy,
+ 					 enum power_supply_property psp)
+ {
++	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
++
+ 	switch (psp) {
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
++		return !!battmgr->device_data;
+ 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
+ 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+ 		return 1;
+@@ -771,16 +941,184 @@
+ 	return 0;
+ }
+ 
++static int qcom_battmgr_kpfe_send_charging(struct qcom_battmgr *battmgr,
++					   bool allow_charging)
++{
++	struct qcom_battmgr_property_request request = {
++		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
++		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
++		.hdr.opcode = cpu_to_le32(BATTMGR_BAT_PROPERTY_SET),
++		.battery = cpu_to_le32(0),
++		.property = cpu_to_le32(BATT_ONLINE),
++		.value = cpu_to_le32(allow_charging),
++	};
++
++	if (!READ_ONCE(battmgr->client) ||
++	    (READ_ONCE(battmgr->shutting_down) && allow_charging))
++		return -ESHUTDOWN;
++
++	return pmic_glink_send(battmgr->client, &request, sizeof(request));
++}
++
++static int qcom_battmgr_kpfe_set_charging(struct qcom_battmgr *battmgr,
++					  bool allow_charging)
++{
++	int drain_ret;
++	int send_ret;
++	int ret;
++
++	ret = qcom_battmgr_request_property_once(battmgr,
++						 BATTMGR_BAT_PROPERTY_SET,
++						 BATT_ONLINE, allow_charging);
++	if (ret && ret != -ESHUTDOWN && ret != -EUCLEAN) {
++		/* The very next firmware send must neutralize any uncertain SET1. */
++		reinit_completion(&battmgr->ack);
++		battmgr->error = 0;
++		send_ret = qcom_battmgr_kpfe_send_charging(battmgr, false);
++		if (send_ret < 0)
++			send_ret = qcom_battmgr_kpfe_send_charging(battmgr, false);
++		drain_ret = qcom_battmgr_drain_ack(battmgr,
++						   msecs_to_jiffies(KPFE_BYPASS_ACK_DRAIN_MS),
++						   KPFE_BYPASS_ACK_DRAIN_MAX);
++		if (send_ret < 0)
++			dev_err_ratelimited(battmgr->dev,
++					    "failed to send emergency KPFE SET0: %d\n",
++					    send_ret);
++		if (send_ret < 0) {
++			WRITE_ONCE(battmgr->kpfe_ack_tainted, true);
++			ret = send_ret;
++		}
++		if (drain_ret)
++			dev_err_ratelimited(battmgr->dev,
++					    "KPFE SET response quarantine overflow\n");
++		if (drain_ret)
++			ret = drain_ret;
++	} else if (ret == -EUCLEAN || ret == -ESHUTDOWN) {
++		/* Teardown must still neutralize an in-flight SET1 before client release. */
++		send_ret = qcom_battmgr_kpfe_send_charging(battmgr, false);
++		if (send_ret < 0)
++			send_ret = qcom_battmgr_kpfe_send_charging(battmgr, false);
++		if (send_ret < 0)
++			dev_err_ratelimited(battmgr->dev,
++					    "failed to send fail-safe KPFE SET0: %d\n",
++					    send_ret);
++	}
++	if (!ret)
++		battmgr->info.online = allow_charging;
++
++	return ret;
++}
++
++static int qcom_battmgr_kpfe_quarantine_disable(struct qcom_battmgr *battmgr)
++{
++	int drain_ret;
++	int ret;
++
++	/*
++	 * The SET acknowledgment does not echo its value. Send SET0 without
++	 * waiting so an ambiguous SET1 is made fail-safe at once, then keep the
++	 * request mutex held while all usual late responses are quarantined.
++	 */
++	reinit_completion(&battmgr->ack);
++	battmgr->error = 0;
++	ret = qcom_battmgr_kpfe_send_charging(battmgr, false);
++	if (ret < 0)
++		ret = qcom_battmgr_kpfe_send_charging(battmgr, false);
++
++	drain_ret = qcom_battmgr_drain_ack(battmgr,
++					   msecs_to_jiffies(KPFE_BYPASS_ACK_DRAIN_MS),
++					   KPFE_BYPASS_ACK_DRAIN_MAX);
++	if (drain_ret)
++		return drain_ret;
++
++	/* This waited SET0 also drains its own timeout before the mutex opens. */
++	return qcom_battmgr_kpfe_set_charging(battmgr, false);
++}
++
++static int qcom_battmgr_kpfe_update_usb_online(struct qcom_battmgr *battmgr)
++{
++	return qcom_battmgr_request_property(battmgr,
++					     BATTMGR_USB_PROPERTY_GET,
++					     USB_ONLINE, 0);
++}
++
++static int qcom_battmgr_kpfe_update_usb_online_once(struct qcom_battmgr *battmgr)
++{
++	return qcom_battmgr_request_property_once(battmgr,
++						  BATTMGR_USB_PROPERTY_GET,
++						  USB_ONLINE, 0);
++}
++
++static bool qcom_battmgr_kpfe_service_current(struct qcom_battmgr *battmgr,
++					      u32 service_gen);
++static bool qcom_battmgr_kpfe_service_ready(struct qcom_battmgr *battmgr,
++					    u32 service_gen);
++
+ static int qcom_battmgr_bat_set_property(struct power_supply *psy,
+ 					 enum power_supply_property psp,
+ 					 const union power_supply_propval *pval)
+ {
+ 	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
++	enum power_supply_charge_behaviour behaviour;
++	bool allow_charging;
++	bool preserve_rearm;
++	u32 service_gen;
++	int ret;
+ 
+ 	if (!battmgr->service_up)
+ 		return -EAGAIN;
+ 
+ 	switch (psp) {
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
++		if (!battmgr->device_data)
++			return -EINVAL;
++
++		behaviour = pval->intval;
++		if (behaviour != POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO &&
++		    behaviour != POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE)
++			return -EINVAL;
++
++		mutex_lock(&battmgr->lock);
++		service_gen = (u32)atomic_read(&battmgr->kpfe_service_gen);
++		if (!qcom_battmgr_kpfe_service_ready(battmgr, service_gen)) {
++			ret = -EAGAIN;
++			goto out_unlock;
++		}
++		ret = qcom_battmgr_kpfe_update_usb_online(battmgr);
++		if (ret)
++			goto out_unlock;
++
++		allow_charging = !battmgr->usb.online ||
++			behaviour == POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
++		preserve_rearm = behaviour == POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE &&
++			battmgr->kpfe_charge_behaviour == behaviour &&
++			battmgr->kpfe_rearm_state != KPFE_REARM_IDLE &&
++			battmgr->kpfe_rearm_service_gen == service_gen;
++		ret = qcom_battmgr_kpfe_set_charging(battmgr, allow_charging);
++		if (!qcom_battmgr_kpfe_service_current(battmgr, service_gen)) {
++			WRITE_ONCE(battmgr->kpfe_usb_online_valid, false);
++			ret = -EAGAIN;
++		}
++		if (!ret) {
++			battmgr->kpfe_charge_behaviour = behaviour;
++			battmgr->kpfe_usb_online = battmgr->usb.online;
++			WRITE_ONCE(battmgr->kpfe_usb_online_valid, true);
++			if (!preserve_rearm) {
++				battmgr->kpfe_rearm_state = KPFE_REARM_IDLE;
++				battmgr->kpfe_rearm_pulse_confirmed = false;
++				battmgr->kpfe_rearm_prepare_after_reconcile = false;
++				battmgr->kpfe_rearm_not_before = 0;
++				battmgr->kpfe_rearm_fast_deadline = 0;
++				cancel_delayed_work(&battmgr->kpfe_charge_rearm_work);
++			}
++		}
++
++out_unlock:
++		mutex_unlock(&battmgr->lock);
++		if (!ret)
++			power_supply_changed(psy);
++
++		return ret;
+ 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
+ 		return qcom_battmgr_set_charge_start_threshold(battmgr, pval->intval);
+ 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+@@ -933,6 +1271,46 @@
+ 	.property_is_writeable = qcom_battmgr_bat_is_writeable,
+ };
+ 
++static const enum power_supply_property kpfe_bat_props[] = {
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_HEALTH,
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
++	POWER_SUPPLY_PROP_CHARGE_TYPE,
++	POWER_SUPPLY_PROP_CAPACITY,
++	POWER_SUPPLY_PROP_VOLTAGE_OCV,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_VOLTAGE_MAX,
++	POWER_SUPPLY_PROP_CURRENT_NOW,
++	POWER_SUPPLY_PROP_TEMP,
++	POWER_SUPPLY_PROP_TECHNOLOGY,
++	POWER_SUPPLY_PROP_CHARGE_COUNTER,
++	POWER_SUPPLY_PROP_CHARGE_NOW,
++	POWER_SUPPLY_PROP_CYCLE_COUNT,
++	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
++	POWER_SUPPLY_PROP_CHARGE_FULL,
++	POWER_SUPPLY_PROP_MODEL_NAME,
++	POWER_SUPPLY_PROP_TIME_TO_FULL_AVG,
++	POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG,
++	POWER_SUPPLY_PROP_INTERNAL_RESISTANCE,
++	POWER_SUPPLY_PROP_STATE_OF_HEALTH,
++	POWER_SUPPLY_PROP_POWER_NOW,
++	POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD,
++	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
++};
++
++static const struct power_supply_desc kpfe_bat_psy_desc = {
++	.name = "battery",
++	.type = POWER_SUPPLY_TYPE_BATTERY,
++	.charge_behaviours = BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
++			     BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE),
++	.properties = kpfe_bat_props,
++	.num_properties = ARRAY_SIZE(kpfe_bat_props),
++	.get_property = qcom_battmgr_bat_get_property,
++	.set_property = qcom_battmgr_bat_set_property,
++	.property_is_writeable = qcom_battmgr_bat_is_writeable,
++};
++
+ static int qcom_battmgr_ac_get_property(struct power_supply *psy,
+ 					enum power_supply_property psp,
+ 					union power_supply_propval *val)
+@@ -1214,6 +1592,8 @@
+ 		power_supply_changed(battmgr->bat_psy);
+ 		break;
+ 	case NOTIF_USB_PROPERTY:
++		if (battmgr->device_data)
++			schedule_work(&battmgr->kpfe_charge_work);
+ 		power_supply_changed(battmgr->usb_psy);
+ 		break;
+ 	case NOTIF_WLS_PROPERTY:
+@@ -1382,6 +1762,30 @@
+ 	}
+ 
+ 	switch (opcode) {
++	case BATTMGR_BAT_PROPERTY_SET:
++		if (payload_len != sizeof(resp->intval)) {
++			dev_warn(battmgr->dev,
++				 "invalid payload length for battery property set: %zd\n",
++				 payload_len);
++			battmgr->error = -ENODATA;
++			break;
++		}
++
++		property = le32_to_cpu(resp->intval.property);
++		if (!battmgr->device_data || property != BATT_ONLINE) {
++			dev_warn(battmgr->dev,
++				 "unexpected battery property set response: %#x\n",
++				 property);
++			battmgr->error = -ENODATA;
++			break;
++		}
++
++		/*
++		 * KPFE firmware leaves value and result undefined in the SET
++		 * acknowledgment. A matching property is the acknowledgment.
++		 */
++		battmgr->error = 0;
++		break;
+ 	case BATTMGR_BAT_PROPERTY_GET:
+ 		property = le32_to_cpu(resp->intval.property);
+ 		if (property == BATT_MODEL_NAME) {
+@@ -1416,6 +1820,9 @@
+ 		case BATT_PRESENT:
+ 			battmgr->info.present = le32_to_cpu(resp->intval.value);
+ 			break;
++		case BATT_ONLINE:
++			battmgr->info.online = le32_to_cpu(resp->intval.value);
++			break;
+ 		case BATT_CHG_TYPE:
+ 			battmgr->info.charge_type = le32_to_cpu(resp->intval.value);
+ 			break;
+@@ -1577,8 +1984,48 @@
+ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
+ {
+ 	const struct pmic_glink_hdr *hdr = data;
++	const struct qcom_battmgr_message *resp = data;
+ 	struct qcom_battmgr *battmgr = priv;
+-	unsigned int opcode = le32_to_cpu(hdr->opcode);
++	unsigned int opcode;
++	u32 property;
++	size_t payload_len;
++
++	if (READ_ONCE(battmgr->shutting_down) || len < sizeof(*hdr))
++		return;
++	opcode = le32_to_cpu(hdr->opcode);
++
++	if (battmgr->device_data && opcode != BATTMGR_NOTIFICATION) {
++		if (READ_ONCE(battmgr->kpfe_draining)) {
++			complete(&battmgr->ack);
++			return;
++		}
++		/* Pairs with request_once's publication of opcode and property. */
++		if (!smp_load_acquire(&battmgr->kpfe_request_active) ||
++		    opcode != battmgr->kpfe_expected_opcode)
++			return;
++		property = battmgr->kpfe_expected_property;
++		if (property != U32_MAX) {
++			payload_len = len - sizeof(*hdr);
++			if (payload_len < sizeof(__le32))
++				goto invalid_response;
++			if (le32_to_cpu(resp->intval.property) != property)
++				return;
++			if (opcode == BATTMGR_BAT_PROPERTY_GET &&
++			    property == BATT_MODEL_NAME) {
++				if (payload_len != sizeof(resp->strval))
++					goto invalid_response;
++			} else {
++				if (payload_len != sizeof(resp->intval))
++					goto invalid_response;
++				if (opcode != BATTMGR_BAT_PROPERTY_SET &&
++				    le32_to_cpu(resp->intval.result)) {
++					battmgr->error = -EIO;
++					complete(&battmgr->ack);
++					return;
++				}
++			}
++		}
++	}
+ 
+ 	if (opcode == BATTMGR_NOTIFICATION)
+ 		qcom_battmgr_notification(battmgr, data, len);
+@@ -1587,6 +2034,493 @@
+ 		qcom_battmgr_sc8280xp_callback(battmgr, data, len);
+ 	else
+ 		qcom_battmgr_sm8350_callback(battmgr, data, len);
++	return;
++
++invalid_response:
++	battmgr->error = -EPROTO;
++	complete(&battmgr->ack);
++}
++
++static bool qcom_battmgr_kpfe_service_current(struct qcom_battmgr *battmgr,
++					      u32 service_gen)
++{
++	return READ_ONCE(battmgr->service_up) &&
++		service_gen == (u32)atomic_read(&battmgr->kpfe_service_gen);
++}
++
++static bool qcom_battmgr_kpfe_service_ready(struct qcom_battmgr *battmgr,
++					    u32 service_gen)
++{
++	return qcom_battmgr_kpfe_service_current(battmgr, service_gen) &&
++		READ_ONCE(battmgr->kpfe_ready_service_gen) == service_gen;
++}
++
++static void qcom_battmgr_kpfe_clear_rearm_locked(struct qcom_battmgr *battmgr)
++{
++	battmgr->kpfe_rearm_state = KPFE_REARM_IDLE;
++	battmgr->kpfe_rearm_pulse_confirmed = false;
++	battmgr->kpfe_rearm_prepare_after_reconcile = false;
++	battmgr->kpfe_rearm_not_before = 0;
++	battmgr->kpfe_rearm_fast_deadline = 0;
++}
++
++static void qcom_battmgr_kpfe_queue_rearm_locked(struct qcom_battmgr *battmgr,
++						 unsigned long delay)
++{
++	if (!qcom_battmgr_kpfe_service_ready(battmgr,
++					     battmgr->kpfe_rearm_service_gen))
++		return;
++
++	mod_delayed_work(system_wq, &battmgr->kpfe_charge_rearm_work, delay);
++}
++
++static void qcom_battmgr_kpfe_start_rearm_locked(struct qcom_battmgr *battmgr,
++						 unsigned int delay_ms)
++{
++	unsigned long now = jiffies;
++	u32 service_gen = (u32)atomic_read(&battmgr->kpfe_service_gen);
++
++	battmgr->kpfe_rearm_state = KPFE_REARM_PREPARE;
++	battmgr->kpfe_rearm_pulse_confirmed = false;
++	battmgr->kpfe_rearm_prepare_after_reconcile = false;
++	battmgr->kpfe_rearm_not_before = now +
++		msecs_to_jiffies(KPFE_BYPASS_REARM_DELAY_MS);
++	battmgr->kpfe_rearm_fast_deadline = now +
++		msecs_to_jiffies(KPFE_BYPASS_RETRY_TIMEOUT_MS);
++	battmgr->kpfe_rearm_service_gen = service_gen;
++	qcom_battmgr_kpfe_queue_rearm_locked(battmgr,
++					     msecs_to_jiffies(delay_ms));
++}
++
++static void qcom_battmgr_kpfe_prepare_rearm_locked(struct qcom_battmgr *battmgr,
++						   unsigned int delay_ms)
++{
++	u32 service_gen = (u32)atomic_read(&battmgr->kpfe_service_gen);
++
++	if (battmgr->kpfe_rearm_state != KPFE_REARM_IDLE &&
++	    battmgr->kpfe_rearm_service_gen == service_gen) {
++		qcom_battmgr_kpfe_queue_rearm_locked(battmgr,
++						     msecs_to_jiffies(delay_ms));
++		return;
++	}
++
++	qcom_battmgr_kpfe_start_rearm_locked(battmgr, delay_ms);
++}
++
++static bool qcom_battmgr_kpfe_retry_rearm_locked(struct qcom_battmgr *battmgr,
++						 bool slow_only)
++{
++	bool slow = slow_only || !battmgr->kpfe_rearm_fast_deadline ||
++		time_after_eq(jiffies, battmgr->kpfe_rearm_fast_deadline);
++	unsigned int delay_ms = slow ? KPFE_BYPASS_SLOW_RETRY_MS :
++		KPFE_BYPASS_RETRY_MS;
++
++	qcom_battmgr_kpfe_queue_rearm_locked(battmgr,
++					     msecs_to_jiffies(delay_ms));
++
++	return slow;
++}
++
++static void qcom_battmgr_kpfe_charge_worker(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr =
++		container_of(work, struct qcom_battmgr, kpfe_charge_work);
++	bool allow_charging;
++	bool known_attach;
++	bool notify = false;
++	bool pending_rearm;
++	bool stale = false;
++	bool usb_online;
++	bool was_offline;
++	bool was_valid;
++	u32 service_gen;
++	int ret = 0;
++
++	service_gen = (u32)atomic_read(&battmgr->kpfe_service_gen);
++	if (!qcom_battmgr_kpfe_service_ready(battmgr, service_gen))
++		return;
++
++	mutex_lock(&battmgr->lock);
++	if (!qcom_battmgr_kpfe_service_ready(battmgr, service_gen)) {
++		stale = true;
++		goto out_unlock;
++	}
++
++	if (battmgr->kpfe_rearm_state != KPFE_REARM_IDLE &&
++	    battmgr->kpfe_rearm_service_gen != service_gen)
++		qcom_battmgr_kpfe_clear_rearm_locked(battmgr);
++
++	was_valid = READ_ONCE(battmgr->kpfe_usb_online_valid);
++	was_offline = was_valid && !battmgr->kpfe_usb_online;
++	pending_rearm = battmgr->kpfe_rearm_state != KPFE_REARM_IDLE &&
++		battmgr->kpfe_rearm_service_gen == service_gen;
++	if (pending_rearm &&
++	    (battmgr->kpfe_rearm_state == KPFE_REARM_DISABLE_ONLY ||
++	     battmgr->kpfe_rearm_state == KPFE_REARM_RECONCILE)) {
++		qcom_battmgr_kpfe_queue_rearm_locked(battmgr, 0);
++		goto out_unlock;
++	}
++
++	ret = qcom_battmgr_kpfe_update_usb_online(battmgr);
++	if (ret) {
++		if (battmgr->kpfe_charge_behaviour ==
++		    POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE &&
++		    (was_offline || !was_valid || pending_rearm)) {
++			qcom_battmgr_kpfe_prepare_rearm_locked(battmgr,
++							       KPFE_BYPASS_RETRY_MS);
++		}
++		goto out_unlock;
++	}
++	if (!qcom_battmgr_kpfe_service_current(battmgr, service_gen)) {
++		WRITE_ONCE(battmgr->kpfe_usb_online_valid, false);
++		stale = true;
++		goto out_unlock;
++	}
++
++	usb_online = battmgr->usb.online;
++	known_attach = was_offline && usb_online;
++
++	if (was_valid && battmgr->kpfe_usb_online == usb_online) {
++		/* Recheck a possibly stale offline read from an attach notification. */
++		if (!usb_online &&
++		    battmgr->kpfe_charge_behaviour ==
++			POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE &&
++		    !pending_rearm)
++			qcom_battmgr_kpfe_prepare_rearm_locked(battmgr,
++							       KPFE_BYPASS_RETRY_MS);
++		goto out_unlock;
++	}
++
++	allow_charging = !usb_online ||
++		battmgr->kpfe_charge_behaviour ==
++			POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
++	ret = qcom_battmgr_kpfe_set_charging(battmgr, allow_charging);
++	if (!qcom_battmgr_kpfe_service_current(battmgr, service_gen)) {
++		WRITE_ONCE(battmgr->kpfe_usb_online_valid, false);
++		stale = true;
++		goto out_unlock;
++	}
++
++	if (ret) {
++		WRITE_ONCE(battmgr->kpfe_usb_online_valid, false);
++		if (battmgr->kpfe_charge_behaviour ==
++		    POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE)
++			qcom_battmgr_kpfe_prepare_rearm_locked(battmgr,
++							       KPFE_BYPASS_RETRY_MS);
++	} else {
++		battmgr->kpfe_usb_online = usb_online;
++		WRITE_ONCE(battmgr->kpfe_usb_online_valid, true);
++		notify = true;
++
++		if (!usb_online || allow_charging) {
++			qcom_battmgr_kpfe_clear_rearm_locked(battmgr);
++			cancel_delayed_work(&battmgr->kpfe_charge_rearm_work);
++		} else if (known_attach || !was_valid || pending_rearm) {
++			qcom_battmgr_kpfe_prepare_rearm_locked(battmgr,
++							       KPFE_BYPASS_REARM_DELAY_MS);
++		}
++	}
++
++out_unlock:
++	mutex_unlock(&battmgr->lock);
++
++	if (ret && !stale)
++		dev_warn_ratelimited(battmgr->dev,
++				     "failed to synchronize KPFE charge behaviour: %d\n",
++				     ret);
++	else if (notify)
++		power_supply_changed(battmgr->bat_psy);
++}
++
++static void qcom_battmgr_kpfe_charge_rearm_worker(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
++						    struct qcom_battmgr,
++						    kpfe_charge_rearm_work);
++	bool allow_failed = false;
++	bool completed = false;
++	bool disable_failed = false;
++	bool notify = false;
++	bool pulse_uncertain = false;
++	bool slow_retry = false;
++	bool stale = false;
++	unsigned long delay;
++	u32 service_gen;
++	int allow_ret = 0;
++	int disable_ret = 0;
++	int pulse_ret = 0;
++	int usb_ret = 0;
++
++	service_gen = (u32)atomic_read(&battmgr->kpfe_service_gen);
++	if (!qcom_battmgr_kpfe_service_ready(battmgr, service_gen))
++		return;
++
++	mutex_lock(&battmgr->lock);
++	if (!qcom_battmgr_kpfe_service_ready(battmgr, service_gen) ||
++	    battmgr->kpfe_rearm_service_gen != service_gen) {
++		stale = true;
++		goto out_unlock;
++	}
++
++	if (battmgr->kpfe_charge_behaviour !=
++	    POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE) {
++		qcom_battmgr_kpfe_clear_rearm_locked(battmgr);
++		cancel_delayed_work(&battmgr->kpfe_charge_rearm_work);
++		goto out_unlock;
++	}
++
++	switch (battmgr->kpfe_rearm_state) {
++	case KPFE_REARM_PREPARE:
++		goto prepare;
++	case KPFE_REARM_DISABLE_ONLY:
++		goto disable_only;
++	case KPFE_REARM_RECONCILE:
++		goto reconcile;
++	case KPFE_REARM_IDLE:
++	default:
++		goto out_unlock;
++	}
++
++prepare:
++	/* PREPARE always establishes the fail-safe SET0 before any USB GET. */
++	battmgr->kpfe_rearm_state = KPFE_REARM_DISABLE_ONLY;
++	battmgr->kpfe_rearm_prepare_after_reconcile = true;
++	disable_ret = qcom_battmgr_kpfe_set_charging(battmgr, false);
++	if (!qcom_battmgr_kpfe_service_current(battmgr, service_gen)) {
++		WRITE_ONCE(battmgr->kpfe_usb_online_valid, false);
++		stale = true;
++		goto out_unlock;
++	}
++	if (disable_ret) {
++		disable_failed = true;
++		slow_retry = qcom_battmgr_kpfe_retry_rearm_locked(battmgr,
++								  false);
++		goto out_unlock;
++	}
++	battmgr->kpfe_rearm_state = KPFE_REARM_PREPARE;
++	battmgr->kpfe_rearm_prepare_after_reconcile = false;
++
++	usb_ret = qcom_battmgr_kpfe_update_usb_online(battmgr);
++	if (!qcom_battmgr_kpfe_service_current(battmgr, service_gen)) {
++		WRITE_ONCE(battmgr->kpfe_usb_online_valid, false);
++		stale = true;
++		goto out_unlock;
++	}
++	if (usb_ret) {
++		slow_retry = qcom_battmgr_kpfe_retry_rearm_locked(battmgr,
++								  false);
++		goto out_unlock;
++	}
++	if (!battmgr->usb.online)
++		goto restore_offline;
++
++	battmgr->kpfe_usb_online = true;
++	WRITE_ONCE(battmgr->kpfe_usb_online_valid, true);
++	notify = true;
++	if (time_before(jiffies, battmgr->kpfe_rearm_not_before)) {
++		delay = battmgr->kpfe_rearm_not_before - jiffies;
++		qcom_battmgr_kpfe_queue_rearm_locked(battmgr, delay);
++		goto out_unlock;
++	}
++
++	/*
++	 * KPFE firmware can initialize the Qualcomm path after the first USB
++	 * online notification without changing its BATT_ONLINE latch. Re-arm
++	 * the already-selected inhibit policy after PPS initialization by
++	 * issuing one guarded 1 -> 0 transition. Enter DISABLE_ONLY before
++	 * SET1 because a transport timeout can still mean that SET1 applied.
++	 */
++	battmgr->kpfe_rearm_state = KPFE_REARM_DISABLE_ONLY;
++	battmgr->kpfe_rearm_pulse_confirmed = false;
++	battmgr->kpfe_rearm_prepare_after_reconcile = false;
++	pulse_ret = qcom_battmgr_kpfe_set_charging(battmgr, true);
++	if (!pulse_ret) {
++		battmgr->kpfe_rearm_pulse_confirmed = true;
++	} else {
++		pulse_uncertain = true;
++		if (pulse_ret != -ETIMEDOUT)
++			battmgr->kpfe_rearm_prepare_after_reconcile = true;
++	}
++
++	/* A successful SET1 ACK is the only dwell; SET0 is always next. */
++	disable_ret = qcom_battmgr_kpfe_set_charging(battmgr, false);
++	if (!qcom_battmgr_kpfe_service_current(battmgr, service_gen)) {
++		WRITE_ONCE(battmgr->kpfe_usb_online_valid, false);
++		stale = true;
++		goto out_unlock;
++	}
++	if (disable_ret) {
++		disable_failed = true;
++		slow_retry = qcom_battmgr_kpfe_retry_rearm_locked(battmgr,
++								  false);
++		goto out_unlock;
++	}
++
++	battmgr->kpfe_rearm_state = KPFE_REARM_RECONCILE;
++	goto reconcile;
++
++disable_only:
++	/* Never put a USB GET in front of this fail-safe SET0 retry. */
++	disable_ret = qcom_battmgr_kpfe_set_charging(battmgr, false);
++	if (!qcom_battmgr_kpfe_service_current(battmgr, service_gen)) {
++		WRITE_ONCE(battmgr->kpfe_usb_online_valid, false);
++		stale = true;
++		goto out_unlock;
++	}
++	if (disable_ret) {
++		disable_failed = true;
++		slow_retry = qcom_battmgr_kpfe_retry_rearm_locked(battmgr,
++								  false);
++		goto out_unlock;
++	}
++
++	battmgr->kpfe_rearm_state = KPFE_REARM_RECONCILE;
++
++reconcile:
++	usb_ret = qcom_battmgr_kpfe_update_usb_online(battmgr);
++	if (!qcom_battmgr_kpfe_service_current(battmgr, service_gen)) {
++		WRITE_ONCE(battmgr->kpfe_usb_online_valid, false);
++		stale = true;
++		goto out_unlock;
++	}
++	if (usb_ret) {
++		WRITE_ONCE(battmgr->kpfe_usb_online_valid, false);
++		slow_retry = qcom_battmgr_kpfe_retry_rearm_locked(battmgr,
++								  true);
++		goto out_unlock;
++	}
++
++	if (battmgr->usb.online) {
++		battmgr->kpfe_usb_online = true;
++		WRITE_ONCE(battmgr->kpfe_usb_online_valid, true);
++		if (battmgr->kpfe_rearm_prepare_after_reconcile) {
++			qcom_battmgr_kpfe_start_rearm_locked(battmgr,
++							     KPFE_BYPASS_REARM_DELAY_MS);
++			notify = true;
++			goto out_unlock;
++		}
++		completed = battmgr->kpfe_rearm_pulse_confirmed;
++		qcom_battmgr_kpfe_clear_rearm_locked(battmgr);
++		cancel_delayed_work(&battmgr->kpfe_charge_rearm_work);
++		notify = true;
++		goto out_unlock;
++	}
++
++restore_offline:
++	/*
++	 * USB is authoritatively offline. Restore the normal offline SET1
++	 * latch, then verify that the cable did not reattach during the write.
++	 */
++	battmgr->kpfe_rearm_state = KPFE_REARM_DISABLE_ONLY;
++	battmgr->kpfe_rearm_pulse_confirmed = false;
++	battmgr->kpfe_rearm_prepare_after_reconcile = true;
++	allow_ret = qcom_battmgr_kpfe_set_charging(battmgr, true);
++	if (!qcom_battmgr_kpfe_service_current(battmgr, service_gen)) {
++		/* A SET1 may have applied, so make one old-generation SET0 attempt. */
++		qcom_battmgr_kpfe_set_charging(battmgr, false);
++		WRITE_ONCE(battmgr->kpfe_usb_online_valid, false);
++		stale = true;
++		goto out_unlock;
++	}
++	if (allow_ret) {
++		allow_failed = true;
++		disable_ret = qcom_battmgr_kpfe_set_charging(battmgr, false);
++		if (!qcom_battmgr_kpfe_service_current(battmgr, service_gen)) {
++			WRITE_ONCE(battmgr->kpfe_usb_online_valid, false);
++			stale = true;
++			goto out_unlock;
++		}
++		if (disable_ret)
++			disable_failed = true;
++		else
++			notify = true;
++		WRITE_ONCE(battmgr->kpfe_usb_online_valid, false);
++		slow_retry = qcom_battmgr_kpfe_retry_rearm_locked(battmgr,
++								  false);
++		goto out_unlock;
++	}
++
++	usb_ret = qcom_battmgr_kpfe_update_usb_online_once(battmgr);
++	if (!qcom_battmgr_kpfe_service_current(battmgr, service_gen)) {
++		/* A SET1 may be active; neutralize it before discarding the work. */
++		if (usb_ret)
++			qcom_battmgr_kpfe_quarantine_disable(battmgr);
++		else
++			qcom_battmgr_kpfe_set_charging(battmgr, false);
++		WRITE_ONCE(battmgr->kpfe_usb_online_valid, false);
++		stale = true;
++		goto out_unlock;
++	}
++	if (!usb_ret && !battmgr->usb.online) {
++		battmgr->kpfe_usb_online = false;
++		WRITE_ONCE(battmgr->kpfe_usb_online_valid, true);
++		qcom_battmgr_kpfe_clear_rearm_locked(battmgr);
++		cancel_delayed_work(&battmgr->kpfe_charge_rearm_work);
++		notify = true;
++		goto out_unlock;
++	}
++
++	/* Unknown or reattached: restore SET0 before doing anything else. */
++	if (usb_ret)
++		disable_ret = qcom_battmgr_kpfe_quarantine_disable(battmgr);
++	else
++		disable_ret = qcom_battmgr_kpfe_set_charging(battmgr, false);
++	if (!qcom_battmgr_kpfe_service_current(battmgr, service_gen)) {
++		WRITE_ONCE(battmgr->kpfe_usb_online_valid, false);
++		stale = true;
++		goto out_unlock;
++	}
++	if (usb_ret) {
++		if (disable_ret)
++			disable_failed = true;
++		else
++			notify = true;
++		WRITE_ONCE(battmgr->kpfe_usb_online_valid, false);
++		slow_retry = qcom_battmgr_kpfe_retry_rearm_locked(battmgr,
++								  false);
++		goto out_unlock;
++	}
++	if (disable_ret) {
++		disable_failed = true;
++		slow_retry = qcom_battmgr_kpfe_retry_rearm_locked(battmgr,
++								  false);
++		goto out_unlock;
++	}
++
++	battmgr->kpfe_usb_online = true;
++	WRITE_ONCE(battmgr->kpfe_usb_online_valid, true);
++	qcom_battmgr_kpfe_start_rearm_locked(battmgr,
++					     KPFE_BYPASS_REARM_DELAY_MS);
++	notify = true;
++
++out_unlock:
++	mutex_unlock(&battmgr->lock);
++
++	if (pulse_uncertain)
++		dev_warn_ratelimited(battmgr->dev,
++				     "KPFE inhibit re-arm SET1 failed or was not acknowledged: %d\n",
++				     pulse_ret);
++	if (disable_failed && slow_retry)
++		dev_err_ratelimited(battmgr->dev,
++				    "still unable to restore KPFE inhibited charging: %d\n",
++				    disable_ret);
++	else if (allow_failed && slow_retry)
++		dev_warn_ratelimited(battmgr->dev,
++				     "still unable to restore KPFE offline charging state: %d\n",
++				     allow_ret);
++	else if (usb_ret && slow_retry)
++		dev_warn_ratelimited(battmgr->dev,
++				     "still unable to verify KPFE USB state: %d\n",
++				     usb_ret);
++	if (completed)
++		dev_info(battmgr->dev,
++			 "re-armed KPFE inhibited charging after USB attach\n");
++
++	if (notify)
++		power_supply_changed(battmgr->bat_psy);
++
++	if (stale)
++		dev_dbg(battmgr->dev, "discarded stale KPFE charge re-arm work\n");
+ }
+ 
+ static void qcom_battmgr_enable_worker(struct work_struct *work)
+@@ -1597,24 +2531,134 @@
+ 		.hdr.type = cpu_to_le32(PMIC_GLINK_NOTIFY),
+ 		.hdr.opcode = cpu_to_le32(BATTMGR_REQUEST_NOTIFICATION),
+ 	};
+-	int ret;
+-
++	bool queue_kpfe = false;
++	bool stale = false;
++	bool taint_recovery_failed = false;
++	u32 service_gen = 0;
++	int ret = 0;
++
++	if (battmgr->device_data) {
++		service_gen = (u32)atomic_read(&battmgr->kpfe_service_gen);
++		if (!qcom_battmgr_kpfe_service_current(battmgr, service_gen))
++			return;
++	}
++
++	mutex_lock(&battmgr->lock);
++	if (battmgr->device_data &&
++	    !qcom_battmgr_kpfe_service_current(battmgr, service_gen)) {
++		stale = true;
++		goto out_unlock;
++	}
++	if (battmgr->device_data &&
++	    READ_ONCE(battmgr->kpfe_ack_tainted)) {
++		/* Reassert fail-safe SET0 on the new service before reopening RPCs. */
++		reinit_completion(&battmgr->ack);
++		battmgr->error = 0;
++		ret = qcom_battmgr_kpfe_send_charging(battmgr, false);
++		if (ret < 0)
++			ret = qcom_battmgr_kpfe_send_charging(battmgr, false);
++		if (ret < 0) {
++			taint_recovery_failed = true;
++			goto out_unlock;
++		}
++		ret = qcom_battmgr_drain_ack(battmgr,
++					     msecs_to_jiffies(KPFE_BYPASS_ACK_DRAIN_MS),
++					     KPFE_BYPASS_ACK_DRAIN_MAX);
++		if (ret) {
++			taint_recovery_failed = true;
++			goto out_unlock;
++		}
++		if (!qcom_battmgr_kpfe_service_current(battmgr, service_gen)) {
++			stale = true;
++			goto out_unlock;
++		}
++		WRITE_ONCE(battmgr->kpfe_ack_tainted, false);
++		ret = qcom_battmgr_kpfe_set_charging(battmgr, false);
++		if (ret) {
++			WRITE_ONCE(battmgr->kpfe_ack_tainted, true);
++			taint_recovery_failed = true;
++			goto out_unlock;
++		}
++		if (!qcom_battmgr_kpfe_service_current(battmgr, service_gen)) {
++			WRITE_ONCE(battmgr->kpfe_ack_tainted, true);
++			stale = true;
++			goto out_unlock;
++		}
++	}
+ 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
+-	if (ret)
++	if (!ret && battmgr->device_data) {
++		if (!qcom_battmgr_kpfe_service_current(battmgr, service_gen)) {
++			stale = true;
++			goto out_unlock;
++		}
++
++		WRITE_ONCE(battmgr->kpfe_ready_service_gen, service_gen);
++		WRITE_ONCE(battmgr->kpfe_usb_online_valid, false);
++		qcom_battmgr_kpfe_clear_rearm_locked(battmgr);
++		cancel_delayed_work(&battmgr->kpfe_charge_rearm_work);
++		if (battmgr->kpfe_charge_behaviour ==
++		    POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE)
++			qcom_battmgr_kpfe_prepare_rearm_locked(battmgr,
++							       KPFE_BYPASS_REARM_DELAY_MS);
++		queue_kpfe = true;
++	}
++
++out_unlock:
++	mutex_unlock(&battmgr->lock);
++
++	if (taint_recovery_failed)
++		dev_err(battmgr->dev,
++			"failed to recover tainted KPFE charge transport: %d\n", ret);
++	else if (ret && !stale)
+ 		dev_err(battmgr->dev, "failed to request power notifications\n");
++	else if (queue_kpfe &&
++		 qcom_battmgr_kpfe_service_ready(battmgr, service_gen))
++		schedule_work(&battmgr->kpfe_charge_work);
+ }
+ 
+ static void qcom_battmgr_pdr_notify(void *priv, int state)
+ {
+ 	struct qcom_battmgr *battmgr = priv;
+ 
++	if (READ_ONCE(battmgr->shutting_down))
++		return;
++
+ 	if (state == SERVREG_SERVICE_STATE_UP) {
+-		battmgr->service_up = true;
++		atomic_inc(&battmgr->kpfe_service_gen);
++		WRITE_ONCE(battmgr->service_up, true);
+ 		schedule_work(&battmgr->enable_work);
+ 	} else {
+-		battmgr->service_up = false;
+-	}
+-}
++		WRITE_ONCE(battmgr->service_up, false);
++		atomic_inc(&battmgr->kpfe_service_gen);
++		if (battmgr->device_data) {
++			cancel_delayed_work(&battmgr->kpfe_charge_rearm_work);
++			WRITE_ONCE(battmgr->kpfe_usb_online_valid, false);
++		}
++	}
++}
++
++static void qcom_battmgr_cancel_work(void *data)
++{
++	struct qcom_battmgr *battmgr = data;
++
++	WRITE_ONCE(battmgr->shutting_down, true);
++	WRITE_ONCE(battmgr->service_up, false);
++	atomic_inc(&battmgr->kpfe_service_gen);
++	disable_work_sync(&battmgr->enable_work);
++	disable_work_sync(&battmgr->kpfe_charge_work);
++	disable_delayed_work_sync(&battmgr->kpfe_charge_rearm_work);
++
++	/* Drain synchronous sysfs requests before devres releases the client. */
++	mutex_lock(&battmgr->lock);
++	WRITE_ONCE(battmgr->client, NULL);
++	mutex_unlock(&battmgr->lock);
++}
++
++static const struct qcom_battmgr_device_data kpfe_device_data = {
++	.root_compatible = "konkr,pocket-fit-elite",
++	.glink_compatible = "qcom,sm8750-pmic-glink",
++	.battery_desc = &kpfe_bat_psy_desc,
++};
+ 
+ static const struct of_device_id qcom_battmgr_of_variants[] = {
+ 	{ .compatible = "qcom,glymur-pmic-glink", .data = (void *)QCOM_BATTMGR_X1E80100 },
+@@ -1645,6 +2689,10 @@
+ 		return -ENOMEM;
+ 
+ 	battmgr->dev = dev;
++	INIT_WORK(&battmgr->kpfe_charge_work, qcom_battmgr_kpfe_charge_worker);
++	INIT_DELAYED_WORK(&battmgr->kpfe_charge_rearm_work,
++			  qcom_battmgr_kpfe_charge_rearm_worker);
++	atomic_set(&battmgr->kpfe_service_gen, 0);
+ 
+ 	psy_cfg.drv_data = battmgr;
+ 	psy_cfg.fwnode = dev_fwnode(&adev->dev);
+@@ -1663,6 +2711,11 @@
+ 		battmgr->variant = (unsigned long)match->data;
+ 	else
+ 		battmgr->variant = QCOM_BATTMGR_SM8350;
++
++	if (of_machine_is_compatible(kpfe_device_data.root_compatible) &&
++	    of_device_is_compatible(dev->parent->of_node,
++				    kpfe_device_data.glink_compatible))
++		battmgr->device_data = &kpfe_device_data;
+ 
+ 	ret = qcom_battmgr_charge_control_thresholds_init(battmgr);
+ 	if (ret < 0)
+@@ -1704,7 +2757,9 @@
+ 		 */
+ 		battmgr->unit = QCOM_BATTMGR_UNIT_mAh;
+ 
+-		if (battmgr->variant == QCOM_BATTMGR_SM8550)
++		if (battmgr->device_data)
++			psy_desc = battmgr->device_data->battery_desc;
++		else if (battmgr->variant == QCOM_BATTMGR_SM8550)
+ 			psy_desc = &sm8550_bat_psy_desc;
+ 		else
+ 			psy_desc = &sm8350_bat_psy_desc;
+@@ -1732,6 +2787,10 @@
+ 	if (IS_ERR(battmgr->client))
+ 		return PTR_ERR(battmgr->client);
+ 
++	ret = devm_add_action_or_reset(dev, qcom_battmgr_cancel_work, battmgr);
++	if (ret)
++		return ret;
++
+ 	pmic_glink_client_register(battmgr->client);
+ 
+ 	return 0;
