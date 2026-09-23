@@ -63,6 +63,12 @@ SYSTEMD_PATHS = (
     "/usr/lib/systemd/system", "/usr/lib/systemd/user",
     "/run/systemd/system", "/run/systemd/user",
 )
+HWDB_CACHE = "/etc/udev/hwdb.bin"
+HWDB_GENERATOR = "/usr/bin/systemd-hwdb"
+HWDB_SOURCE_PATHS = (
+    "/etc/udev/hwdb.d", "/run/udev/hwdb.d",
+    "/usr/local/lib/udev/hwdb.d", "/usr/lib/udev/hwdb.d",
+)
 NEW_CONFIG_PATHS = {
     "/etc/armada-charging", "/etc/armada-charging/devices.json",
     "/etc/armada-charging/ownership.json",
@@ -156,6 +162,85 @@ def enablement_snapshot(root=Path("/")):
                                          for part in child.parts):
                 result[relative] = entry(child)
     return result
+
+
+def hwdb_sources(root):
+    sources = snapshot(root, HWDB_SOURCE_PATHS)
+    for name, metadata in list(sources.items()):
+        if metadata is None:
+            continue
+        metadata.pop("xattrs")
+        if "target" not in metadata:
+            require(stat.S_ISREG(metadata["mode"]) or stat.S_ISDIR(metadata["mode"]),
+                    f"Unsupported hwdb source type: {name}")
+            continue
+        if metadata["target"] == "/dev/null":
+            continue
+        target = path_at(root, name).resolve(strict=True)
+        require(target.is_relative_to(root) and target.is_file(), f"Unsupported hwdb source link: {name}")
+        target_metadata = entry(target)
+        target_metadata.pop("xattrs")
+        sources[f"{name} -> {target.relative_to(root)}"] = target_metadata
+    return sources
+
+
+def hwdb_generator(root):
+    executable = path_at(root, HWDB_GENERATOR)
+    require(executable.is_file(), "Missing hwdb generator")
+    dependencies = run(["ldd", str(executable)])
+    require(not dependencies.stderr.strip(), "Cannot inspect hwdb generator dependencies")
+    names = {HWDB_GENERATOR}
+    for line in dependencies.stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith("linux-vdso."):
+            continue
+        match = re.search(r"(?:^|\s)(/\S+)\s+\(", line)
+        require(match is not None, f"Unresolved hwdb generator dependency: {line}")
+        names.add(match[1])
+    require(len(names) > 1, "Missing hwdb generator dependency identities")
+    result = {}
+    for name in sorted(names):
+        path = path_at(root, name)
+        target = path.resolve(strict=True)
+        require(target.is_relative_to(root) and target.is_file(), f"Invalid hwdb generator dependency: {name}")
+        result[name] = entry(path)
+        result["/" + str(target.relative_to(root))] = entry(target)
+    return result
+
+
+def capture_hwdb(root=Path("/")):
+    cache = path_at(root, HWDB_CACHE)
+    require(cache.is_file() and not cache.is_symlink(), "Expected a preexisting regular hwdb cache")
+    metadata = cache.stat()
+    return {"cache": entry(cache), "times": (metadata.st_atime_ns, metadata.st_mtime_ns),
+            "sources": hwdb_sources(root), "generator": hwdb_generator(root)}
+
+
+def restore_hwdb_metadata(before, root=Path("/")):
+    after = capture_hwdb(root)
+    report = {"before": before["cache"], "regenerated": after["cache"],
+              "source_sha256": manifest_digest(before["sources"]),
+              "generator_sha256": manifest_digest(before["generator"]),
+              "generator_paths": sorted(before["generator"])}
+    print(json.dumps({"hwdb_cache": report}, sort_keys=True))
+    require(before["sources"] == after["sources"], "Hwdb sources changed; refusing cache restoration")
+    require(before["generator"] == after["generator"], "Hwdb generator changed; refusing cache restoration")
+    original = before["cache"]
+    require(original["sha256"] == after["cache"]["sha256"],
+            "Regenerated hwdb cache bytes changed; refusing restoration")
+    cache = path_at(root, HWDB_CACHE)
+    # The stock hwdb RPM trigger atomically replaces the cache and can drop image xattrs.
+    os.chown(cache, original["uid"], original["gid"], follow_symlinks=False)
+    cache.chmod(stat.S_IMODE(original["mode"]))
+    for name in set(os.listxattr(cache, follow_symlinks=False)) - set(original["xattrs"]):
+        os.removexattr(cache, name, follow_symlinks=False)
+    for name, value in original["xattrs"].items():
+        os.setxattr(cache, name, base64.b64decode(value), follow_symlinks=False)
+    restored = entry(cache)
+    require(restored == original, "Hwdb cache metadata restoration was incomplete")
+    os.utime(cache, ns=before["times"], follow_symlinks=False)
+    return {**report, "restored": restored,
+            "metadata_restored": after["cache"] != original, "compiled_bytes_unchanged": True}
 
 
 def verify_snapshots(before, after):
@@ -305,6 +390,7 @@ def install():
     verify_base_inventory(before_packages)
     before = snapshot()
     enabled_before = enablement_snapshot()
+    hwdb_before = capture_hwdb()
     run(["rpm", "-Uvh", "--test", *paths])
     result = run(["rpm", "-Uvh", *paths])
     print(result.stdout, end="")
@@ -312,6 +398,7 @@ def install():
     run(["rpmdb", "--verifydb"])
     after_packages = parse_inventory(run(["rpm", "-qa", "--qf", QUERY_FORMAT]).stdout)
     verify_inventory(before_packages, after_packages)
+    hwdb = restore_hwdb_metadata(hwdb_before)
     after = snapshot()
     verify_snapshots(before, after)
     require(enablement_snapshot() == enabled_before, "Systemd enablement changed")
@@ -326,6 +413,7 @@ def install():
         "protected_paths": list(PROTECTED_PATHS), "protected_entries": len(before),
         "protected_sha256": manifest_digest(before), "enablement_sha256": manifest_digest(enabled_before),
         "preserved_config_verification": preserved,
+        "hwdb_cache": hwdb,
         "integration_files": {name: sha256(Path(name)) for name in INTEGRATION_FILES},
         "kernel_files": {name: sha256(Path(name)) for name in (*KERNEL_FILES, "/usr/lib/modules/7.2.3/initramfs.img")},
         "kernel_rebuilt": False, "initramfs_regenerated": False, "charging_enabled": False,
