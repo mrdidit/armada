@@ -1,407 +1,181 @@
----
-name: Build KPFE charging test update
+# SPDX-License-Identifier: GPL-2.0-or-later
+name: Assemble KPFE desktop policy test
 on:
   workflow_dispatch:
 
-env:
-  ARMADA_CANONICAL_IMAGE: "ghcr.io/armada-os/armada"
-  ARMADA_LEGACY_IMAGE: "ghcr.io/virtudude/armada"
-  BASE_IMAGE: "ghcr.io/mrdidit/armada@sha256:8dc90f1af081bde316beaac10905e9d50dbf7fff93d559c2271c0d77237da3ba"
-  IMAGE_DESC: "Armada KPFE charge-policy test, retaining the installed userspace and backlight baseline"
-  IMAGE_NAME: "${{ github.event.repository.name }}"
-  IMAGE_REGISTRY: "ghcr.io/${{ github.repository_owner }}"
-
+permissions: {}
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: kpfe-desktop-policy-test
   cancel-in-progress: false
 
+env:
+  BASE_IMAGE: ghcr.io/mrdidit/armada@sha256:3ad2d5de4575d8fffacc92a77aae6a382f9a0066818f5f99e8de3d35cb26313c
+  IMAGE: ghcr.io/mrdidit/armada
+  TEST_TAG: test-kpfe-desktop-policy-20260923
+  INPUT_SHA256: a66e1d8cca4b220639fa19ce1bc0586fb1950d3163089b4bba239c5d4c2567fc
+
 jobs:
-  packages:
-    name: Packages
-    if: github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-kpfe-charge-policy-20260921'
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/packages.yml
-    secrets: inherit
-
-  build_push:
-    name: Container image
-    needs: packages
+  inputs:
+    if: github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-kpfe-desktop-policy-20260923'
     runs-on: ubuntu-24.04-arm
-    outputs:
-      channel: ${{ steps.channel.outputs.channel }}
-      tag: ${{ steps.channel.outputs.tag }}
-      digest: ${{ steps.push.outputs.digest }}
-      revision: ${{ steps.version.outputs.revision }}
-
     permissions:
-      contents: read
-      packages: write
-      id-token: write
-
+      contents: write # GitHub restricts draft-release visibility to push access.
     steps:
-      - name: Prepare environment
-        run: |
-          echo "IMAGE_REGISTRY=${IMAGE_REGISTRY,,}" >> ${GITHUB_ENV}
-          echo "IMAGE_NAME=${IMAGE_NAME,,}" >> ${GITHUB_ENV}
-
-      - name: Resolve publication channel
-        id: channel
+      - name: Download pinned unpublished build inputs
         env:
-          BUILD_REF: ${{ github.ref }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [[ "${BUILD_REF}" != refs/heads/* ]]; then
-            echo "::error::Select a branch to build."
-            exit 1
-          fi
-          branch="${BUILD_REF#refs/heads/}"
-          test "${branch}" = test-kpfe-charge-policy-20260921
-          case "${branch}" in
-            main) tag=testing; channel=preview ;;
-            staging) tag=staging; channel=staging ;;
-            testing|preview|beta|stable|latest)
-              echo "::error::Reserved release channel. Build main/staging or use Promote channel."
-              exit 1 ;;
-            *) tag="${branch}"; channel="" ;;
-          esac
-          if ! [[ "${tag}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
-            echo "::error::Branch cannot be used as a container tag."
-            exit 1
-          fi
-          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
-          echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
+          gh api repos/mrdidit/armada/releases/394610908 |
+            jq -e '.draft == true and .tag_name == "kpfe-desktop-policy-inputs-20260923"'
+          gh api -H 'Accept: application/octet-stream' \
+            repos/mrdidit/armada/releases/assets/583676230 > inputs.tar.gz
+          printf '%s  inputs.tar.gz\n' "$INPUT_SHA256" | sha256sum -c -
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-policy-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: inputs.tar.gz
+          retention-days: 7
+          if-no-files-found: error
 
-      - name: Install container tools
+  assemble:
+    needs: inputs
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Download this run's verified inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          set -euxo pipefail
-          # ubuntu-24.04 dropped these from the runner image; the build action,
-          # validation, and push all need them.
-          need=""
-          for t in buildah jq skopeo openssl; do
-            command -v "$t" >/dev/null || need="$need $t"
-          done
-          [ -z "$need" ] || { sudo apt-get update && sudo apt-get install -y $need; }
-
-      - name: Check signing key
+          set -euo pipefail
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "desktop-policy-inputs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --dir "$RUNNER_TEMP/input"
+          cd "$RUNNER_TEMP/input"
+          printf '%s  inputs.tar.gz\n' "$INPUT_SHA256" | sha256sum -c -
+          mkdir "$GITHUB_WORKSPACE/policy-inputs"
+          tar -xzf inputs.tar.gz --no-same-owner -C "$GITHUB_WORKSPACE/policy-inputs"
+          cd "$GITHUB_WORKSPACE/policy-inputs"
+          sha256sum -c SHA256SUMS
+          test "$(find rpms -type f | wc -l)" -eq 4
+          test "$(find srpms -type f | wc -l)" -eq 3
+      - name: Check local assembly tests
+        run: python3 -B -m unittest discover -s tests -p test_charging_image.py -v
+      - name: Install image tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y buildah skopeo jq openssl
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.6.3
+      - name: Verify signed base and prepare image configuration
+        id: config
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/evidence"
+          cosign verify --key build_files/kpfe-test-signing.pub "$BASE_IMAGE" > "$RUNNER_TEMP/evidence/base-signature.json"
+          skopeo inspect --override-arch arm64 --config "docker://$BASE_IMAGE" > "$RUNNER_TEMP/evidence/base-config.json"
+          jq -e '.architecture == "arm64" and .os == "linux" and .config.Cmd == ["/sbin/init"]' "$RUNNER_TEMP/evidence/base-config.json"
+          version="20260923.policy.${GITHUB_SHA:0:7}"
+          jq --arg version "$version" --arg revision "$GITHUB_SHA" --arg base "$BASE_IMAGE" '
+            .config |
+            .Labels["org.opencontainers.image.version"] = $version |
+            .Labels["org.opencontainers.image.revision"] = $revision |
+            .Labels["org.opencontainers.image.created"] = (now | todateiso8601) |
+            .Labels["org.opencontainers.image.description"] = "KPFE disabled charging-policy and KDE integration test" |
+            .Labels["org.opencontainers.image.source"] = ("https://github.com/mrdidit/armada/tree/" + $revision) |
+            .Labels["org.opencontainers.image.documentation"] = ("https://github.com/mrdidit/armada/blob/" + $revision + "/docs/KPFE-DESKTOP-POLICY-TEST.md") |
+            .Labels["org.opencontainers.image.base.digest"] = ($base | split("@")[1]) |
+            del(.Labels["ostree.commit"], .Labels["ostree.final-diffid"])' \
+            "$RUNNER_TEMP/evidence/base-config.json" > "$RUNNER_TEMP/evidence/runtime-config.json"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Check signing identity before assembly
         env:
           SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
         run: |
-          if [ -z "${SIGNING_SECRET}" ]; then
-            echo "::error::SIGNING_SECRET is not set — refusing to publish an unsigned image (devices verify ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }})."
-            exit 1
-          fi
-
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-
-      - name: Install just
-        uses: ublue-os/just-action@30ab4659369934b65b655bf8d2fa4ddd6547d384 # v3
-
-      - name: Get image version
-        id: version
-        run: |
-          echo "created=$(date -u +%Y\-%m\-%d\T%H\:%M\:%S\Z)" >> $GITHUB_OUTPUT
-          echo "version=$(TZ=America/New_York date +%Y%m%d).$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Generate image metadata
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        id: metadata
-        with:
-          tags: |
-            type=raw,value=${{ steps.channel.outputs.tag }}
-          labels: |
-            org.opencontainers.image.revision=${{ steps.version.outputs.revision }}
-            org.opencontainers.image.created=${{ steps.version.outputs.created }}
-            org.opencontainers.image.description=${{ env.IMAGE_DESC }}
-            org.opencontainers.image.documentation=https://raw.githubusercontent.com/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}/${{ steps.version.outputs.revision }}/docs/KPFE-CHARGING-TEST.md
-            org.opencontainers.image.licenses=GPL-2.0-or-later
-            org.opencontainers.image.source=https://github.com/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}/blob/${{ steps.version.outputs.revision }}/Containerfile.charging-test
-            org.opencontainers.image.title=${{ env.IMAGE_NAME }}
-            org.opencontainers.image.url=https://github.com/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}/tree/${{ steps.version.outputs.revision }}
-            org.opencontainers.image.vendor=${{ github.repository_owner }}
-            org.opencontainers.image.version=${{ steps.version.outputs.version }}
-            containers.bootc=1
-          sep-tags: " "
-          sep-annotations: " "
-
-      - name: Prepare Chunkah config
-        id: chunkah_config
+          set -euo pipefail
+          test -n "$SIGNING_SECRET"
+          printf '%s\n' "$SIGNING_SECRET" | openssl pkey -pubout -outform DER > "$RUNNER_TEMP/signing-key.der"
+          openssl pkey -pubin -in build_files/kpfe-test-signing.pub -outform DER > "$RUNNER_TEMP/trusted-key.der"
+          cmp "$RUNNER_TEMP/signing-key.der" "$RUNNER_TEMP/trusted-key.der"
+      - name: Assemble without rebuilding kernel or RPMs
         env:
-          METADATA_JSON: ${{ steps.metadata.outputs.json }}
+          VERSION: ${{ steps.config.outputs.version }}
         run: |
           set -euo pipefail
-          base_digest=$(skopeo inspect --override-arch arm64 --format '{{.Digest}}' \
-            "docker://${BASE_IMAGE}")
-          test "${BASE_IMAGE}" = "ghcr.io/mrdidit/armada@${base_digest}"
-          base_image="${BASE_IMAGE}"
-          skopeo inspect --override-arch arm64 --config "docker://${base_image}" |
-            jq -e '.architecture == "arm64" and .os == "linux"'
-          config=$(skopeo inspect --override-arch arm64 --config \
-            "docker://${base_image}" |
-            jq -c --argjson metadata "${METADATA_JSON}" '
-              .config |
-              .Labels = ((.Labels // {}) + ($metadata.labels // {})) |
-              del(.Labels["ostree.commit"]) |
-              del(.Labels["ostree.final-diffid"])')
-          printf '%s\n' "${config}" > "${RUNNER_TEMP}/chunkah-config.json"
-          echo "base_image=${base_image}" >> "${GITHUB_OUTPUT}"
-          echo "config=${config}" >> "${GITHUB_OUTPUT}"
-
-      - name: Resolve package refs
-        env:
-          BUILD_ARGS: ${{ needs.packages.outputs.build_args }}
-        run: |
-          set -euo pipefail
-          printf '%s' "${BUILD_ARGS}" > "${RUNNER_TEMP}/package-refs.env"
-          expected=$(grep -c '^ARG [A-Z0-9_]*_REF$' Containerfile.charging-test)
-          got=$(grep -c '_REF=' "${RUNNER_TEMP}/package-refs.env")
-          if [ "${expected}" -ne "${got}" ]; then
-            echo "::error::Test Containerfile wants ${expected} package refs, resolver gave ${got}"
-            exit 1
-          fi
-          test "${got}" -eq 1
-          grep -Eq '^KERNEL_REF=ghcr.io/mrdidit/armada/pkg/kernel:[a-f0-9]{32}$' "${RUNNER_TEMP}/package-refs.env"
-          kernel_ref=$(cut -d= -f2- "${RUNNER_TEMP}/package-refs.env")
-          kernel_digest=$(skopeo inspect --format '{{.Digest}}' "docker://${kernel_ref}")
-          [[ "${kernel_digest}" =~ ^sha256:[a-f0-9]{64}$ ]]
-          printf 'KERNEL_REF=%s@%s\n' "${kernel_ref%:*}" "${kernel_digest}" > "${RUNNER_TEMP}/package-refs.env"
-          echo "Resolved ${got} package refs:" && cat "${RUNNER_TEMP}/package-refs.env"
-
-      - name: Require native OverlayFS
-        run: |
-          set -euxo pipefail
           buildah info --storage-opt=overlay.mount_program= |
             jq -e '.store.GraphStatus["Native Overlay Diff"] == "true"'
-
-      - name: Build container image
-        id: build_image
-        uses: redhat-actions/buildah-build@719e3c40d8af9790c23eca13f7daa339f2867034 # v3.1.0
-        with:
-          containerfiles: |
-            ./Containerfile.charging-test
-          image: ${{ env.IMAGE_NAME }}
-          tags: build-output
-          labels: ${{ steps.metadata.outputs.labels }}
-          build-args: |
-            ARMADA_VERSION=${{ steps.version.outputs.version }}
-            BASE_IMAGE=${{ steps.chunkah_config.outputs.base_image }}
-            CHUNKAH_CONFIG_STR=${{ steps.chunkah_config.outputs.config }}
-          # armada-rootfs is consumed through RUN --mount, so retain otherwise-unused stages.
-          extra-args: |
-            --build-arg-file=${{ runner.temp }}/package-refs.env
-            --skip-unused-stages=false
-            --target=chunkah
-            --volume=${{ runner.temp }}:/run/src
-            --security-opt=label=disable
-            --storage-opt=overlay.mount_program=
-          oci: false
-
-      - name: Validate Chunkah output
-        id: chunkah_output
+          buildah bud --storage-opt=overlay.mount_program= \
+            --format docker --target chunkah --skip-unused-stages=false \
+            --security-opt label=disable --volume "$RUNNER_TEMP:/run/src" \
+            --build-arg "BASE_IMAGE=$BASE_IMAGE" --build-arg "ARMADA_VERSION=$VERSION" \
+            --build-arg "CHUNKAH_CONFIG_STR=$(jq -c . "$RUNNER_TEMP/evidence/runtime-config.json")" \
+            -f Containerfile.desktop-policy-test -t localhost/kpfe-policy-assembly .
+      - name: Verify serialized image
         run: |
-          set -euxo pipefail
-          CHUNKAH_LOG_FILE="${RUNNER_TEMP}/chunkah.log"
-          CHUNKAH_MANIFEST_FILE="${RUNNER_TEMP}/chunkah-manifest.json"
-          CHUNKAH_IMAGE_CONFIG_FILE="${RUNNER_TEMP}/chunkah-image-config.json"
+          set -euo pipefail
           for component in steam proton fex-rootfs; do
-            if ! grep -Eq "creating tar layer .*\"xattr/${component}\"" "${CHUNKAH_LOG_FILE}"; then
-              echo "::error::Chunkah did not emit an xattr/${component} component layer"
-              exit 1
-            fi
+            grep -Eq "creating tar layer .*\"xattr/${component}\"" "$RUNNER_TEMP/chunkah.log"
           done
-
-          CHUNKED_REF="oci:${RUNNER_TEMP}/chunked"
-          skopeo inspect --raw "${CHUNKED_REF}" > "${CHUNKAH_MANIFEST_FILE}"
-          jq -e '(.layers | length) > 1 and (.layers | length) <= 128' \
-            "${CHUNKAH_MANIFEST_FILE}" || {
-              echo "::error::Chunkah output has an invalid layer count"
-              exit 1
-            }
-          jq -e '((.annotations // {}) | has("ostree.commit") | not) and
-            ((.annotations // {}) | has("ostree.final-diffid") | not)' \
-            "${CHUNKAH_MANIFEST_FILE}" || {
-              echo "::error::Chunkah output retained OSTree manifest annotations"
-              exit 1
-            }
-          skopeo inspect --config "${CHUNKED_REF}" > "${CHUNKAH_IMAGE_CONFIG_FILE}"
-          jq -e --slurpfile expected "${RUNNER_TEMP}/chunkah-config.json" \
-            '.config == $expected[0]' "${CHUNKAH_IMAGE_CONFIG_FILE}" || {
-              echo "::error::Chunkah output did not preserve the prepared runtime config"
-              exit 1
-            }
-          jq -e '.architecture == "arm64" and .os == "linux" and
-              .config.Cmd == ["/sbin/init"] and
-              .config.Labels["containers.bootc"] == "1" and
-              .config.Labels["ostree.bootable"] == "true" and
-              (.config.Labels | has("ostree.commit") | not) and
-              (.config.Labels | has("ostree.final-diffid") | not)' \
-            "${CHUNKAH_IMAGE_CONFIG_FILE}"
-          python3 build_files/verify-steam-bootstrap.py --oci "${RUNNER_TEMP}/chunked"
-          echo "Steam bootstrap manifest verified in Chunkah output"
-          jq '{layers: (.layers | length), compressed_bytes: ([.layers[].size] | add)}' \
-            "${CHUNKAH_MANIFEST_FILE}"
-          echo "ref=${CHUNKED_REF}" >> "${GITHUB_OUTPUT}"
-
-      - name: Push container to GHCR
-        id: push
-        run: |
-          set -euxo pipefail
-          echo "${{ secrets.GITHUB_TOKEN }}" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
-          IMAGE_FULL="${IMAGE_REGISTRY}/${IMAGE_NAME}"
-          BUILD_TAG="build-${{ steps.version.outputs.version }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          n=0
-          until skopeo copy --all \
-                "${{ steps.chunkah_output.outputs.ref }}" "docker://${IMAGE_FULL}:${BUILD_TAG}"; do
-            n=$((n + 1)); [ "${n}" -ge 3 ] && exit 1; sleep 15
-          done
-          digest=$(skopeo inspect --format '{{.Digest}}' "docker://${IMAGE_FULL}:${BUILD_TAG}")
-          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
-
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        if: env.HAVE_SIGNING_SECRET == 'true'
+          skopeo inspect --raw "oci:$RUNNER_TEMP/chunked" > "$RUNNER_TEMP/evidence/manifest.json"
+          skopeo inspect --config "oci:$RUNNER_TEMP/chunked" > "$RUNNER_TEMP/evidence/config.json"
+          jq -e '(.layers | length) > 1 and (.layers | length) <= 128 and
+            ((.annotations // {}) | has("ostree.commit") | not) and
+            ((.annotations // {}) | has("ostree.final-diffid") | not)' "$RUNNER_TEMP/evidence/manifest.json"
+          jq -e --slurpfile expected "$RUNNER_TEMP/evidence/runtime-config.json" '
+            .config == $expected[0] and .architecture == "arm64" and .os == "linux" and
+            .config.Labels["containers.bootc"] == "1" and .config.Labels["ostree.bootable"] == "true"' "$RUNNER_TEMP/evidence/config.json"
+          python3 build_files/verify-steam-bootstrap.py --oci "$RUNNER_TEMP/chunked"
+          cp "$RUNNER_TEMP/chunkah.log" "$RUNNER_TEMP/evidence/"
+      - name: Publish unique build tag and sign exact digest
+        id: publish
         env:
-          HAVE_SIGNING_SECRET: ${{ secrets.SIGNING_SECRET != '' }}
-        with:
-          cosign-release: 'v2.6.3'
-
-      - name: Sign container image
-        if: env.HAVE_SIGNING_SECRET == 'true'
+          REGISTRY_TOKEN: ${{ github.token }}
+          SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
+          VERSION: ${{ steps.config.outputs.version }}
+          COSIGN_PASSWORD: ''
         run: |
           set -euo pipefail
-          IMAGE_FULL="${IMAGE_REGISTRY}/${IMAGE_NAME}"
-          [[ "${IMAGE_DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]
-          IMAGE_REF="${IMAGE_FULL}@${IMAGE_DIGEST}"
-          signing_key=env://COSIGN_PRIVATE_KEY
-          if [ "${FORK_PEM_SIGNING}" = true ]; then
-            test "${IMAGE_FULL}" = ghcr.io/mrdidit/armada
-            umask 077
-            signing_dir=$(mktemp -d "${RUNNER_TEMP}/armada-signing.XXXXXX")
-            trap 'rm -rf -- "${signing_dir}"' EXIT
-            trap 'exit 1' HUP INT TERM
-            printf '%s\n' "${COSIGN_PRIVATE_KEY}" > "${signing_dir}/original.pem"
-            unset COSIGN_PRIVATE_KEY
-            export COSIGN_PASSWORD=''
-            cosign import-key-pair --key "${signing_dir}/original.pem" --output-key-prefix "${signing_dir}/imported"
-            openssl pkey -in "${signing_dir}/original.pem" -pubout -outform DER -out "${signing_dir}/original-public.der"
-            openssl pkey -pubin -in "${signing_dir}/imported.pub" -pubout -outform DER -out "${signing_dir}/imported-public.der"
-            cmp "${signing_dir}/original-public.der" "${signing_dir}/imported-public.der"
-            cp "${signing_dir}/imported.pub" "${RUNNER_TEMP}/kpfe-charge-policy-test-signing.pub"
-            signing_key="${signing_dir}/imported.key"
-          fi
-          # Cosign and Skopeo use separate registry auth stores.
-          printf '%s' "${REGISTRY_TOKEN}" | cosign login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
-          # Sign the digest, not a tag (a concurrent run could re-point the tag).
-          # --new-bundle-format=false: bootc's verifier expects the legacy .sig; the
-          # default flips in cosign v3.
-          cosign sign -y --new-bundle-format=false --key "${signing_key}" "${IMAGE_REF}"
-
-          # Legacy-hosted images also need the canonical identity required by bridge policy.
-          if [ "${IMAGE_FULL}" = "${ARMADA_LEGACY_IMAGE}" ]; then
-            cosign sign -y --new-bundle-format=false \
-              --key "${signing_key}" \
-              --sign-container-identity "${ARMADA_CANONICAL_IMAGE}" \
-              "${IMAGE_REF}"
-          fi
-
-          if [ "${FORK_PEM_SIGNING}" = true ]; then
-            cosign verify --key "${signing_dir}/imported.pub" "${IMAGE_REF}" > "${RUNNER_TEMP}/armada-signature.json"
-            jq -e --arg digest "${IMAGE_DIGEST}" --arg image "${IMAGE_FULL}" \
-              'any(.[]; .critical.image["docker-manifest-digest"] == $digest
-                 and .critical.identity["docker-reference"] == $image)' \
-              "${RUNNER_TEMP}/armada-signature.json"
-          elif [ "${{ github.event.repository.fork }}" != "true" ]; then
-            cosign verify --key system_files/etc/pki/containers/armada.pub "${IMAGE_REF}"
-            if [ "${IMAGE_FULL}" = "${ARMADA_LEGACY_IMAGE}" ]; then
-              cosign verify --check-claims=false \
-                --key system_files/etc/pki/containers/armada.pub \
-                "${IMAGE_REF}" |
-                jq -s -e --arg identity "${ARMADA_CANONICAL_IMAGE}" \
-                  'any(.. | objects; .critical?.identity?["docker-reference"]? == $identity)'
-            fi
-          fi
-        env:
-          HAVE_SIGNING_SECRET: ${{ secrets.SIGNING_SECRET != '' }}
-          TAGS: ${{ steps.push.outputs.digest }}
-          COSIGN_EXPERIMENTAL: false
-          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
-          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
-          FORK_PEM_SIGNING: ${{ github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-kpfe-charge-policy-20260921' }}
-
-      - name: Publish channel tags
-        if: env.HAVE_SIGNING_SECRET == 'true'
-        run: |
-          set -euo pipefail
-          IMAGE_FULL="${IMAGE_REGISTRY}/${IMAGE_NAME}"
-          SRC="docker://${IMAGE_FULL}@${{ steps.push.outputs.digest }}"
-          for tag in ${{ steps.metadata.outputs.tags }}; do
-            n=0
-            until skopeo copy --all "${SRC}" "docker://${IMAGE_FULL}:${tag}"; do
-              n=$((n + 1)); [ "${n}" -ge 3 ] && exit 1; sleep 15
-            done
-            tag_digest=$(skopeo inspect --format '{{.Digest}}' "docker://${IMAGE_FULL}:${tag}")
-            if [ "${tag_digest}" != "${{ steps.push.outputs.digest }}" ]; then
-              echo "::error::${tag} resolved to ${tag_digest}, not the signed digest ${{ steps.push.outputs.digest }}"
-              exit 1
-            fi
-          done
-          {
-            printf '### Signed container published\n\n'
-            printf 'Digest: `%s@%s`\n\n' "${IMAGE_FULL}" "${{ steps.push.outputs.digest }}"
-            printf 'Promote this exact build with source: `build-%s-%s-%s`\n' \
-              "${{ steps.version.outputs.version }}" "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}"
-          } >> "${GITHUB_STEP_SUMMARY}"
-        env:
-          HAVE_SIGNING_SECRET: ${{ secrets.SIGNING_SECRET != '' }}
-
-      - name: Save test build information
-        if: github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-kpfe-charge-policy-20260921'
-        env:
-          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
-          SOURCE_REVISION: ${{ steps.version.outputs.revision }}
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/kpfe-charge-policy-build-info"
-          cp "${RUNNER_TEMP}/kpfe-charge-policy-test-signing.pub" "${RUNNER_TEMP}/kpfe-charge-policy-build-info/"
-          cp "${RUNNER_TEMP}/package-refs.env" "${RUNNER_TEMP}/armada-signature.json" "${RUNNER_TEMP}/kpfe-charge-policy-build-info/"
-          sha256sum packages/kernel/patches/0950-power-supply-qcom-battmgr-kpfe-charge-policy.patch > "${RUNNER_TEMP}/kpfe-charge-policy-build-info/patch.sha256"
-          jq -n --arg image "${IMAGE_REGISTRY}/${IMAGE_NAME}@${IMAGE_DIGEST}" \
-            --arg revision "${SOURCE_REVISION}" \
-            --arg base "${BASE_IMAGE}" \
-            '{image: $image, revision: $revision, base: $base, scope: "kernel-only test update"}' > "${RUNNER_TEMP}/kpfe-charge-policy-build-info/build.json"
-
-      - name: Upload test build information
-        if: github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-kpfe-charge-policy-20260921'
+          printf '%s' "$REGISTRY_TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          printf '%s' "$REGISTRY_TOKEN" | cosign login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          build_tag="build-${VERSION}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          skopeo copy --all "oci:$RUNNER_TEMP/chunked" "docker://$IMAGE:$build_tag"
+          digest=$(skopeo inspect --format '{{.Digest}}' "docker://$IMAGE:$build_tag")
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          umask 077
+          keydir=$(mktemp -d "$RUNNER_TEMP/policy-signing.XXXXXXXX")
+          trap 'rm -f -- "$keydir/original.pem" "$keydir/imported.key" "$keydir/imported.pub"; rmdir "$keydir"' EXIT
+          printf '%s\n' "$SIGNING_SECRET" > "$keydir/original.pem"
+          unset SIGNING_SECRET
+          cosign import-key-pair --key "$keydir/original.pem" --output-key-prefix "$keydir/imported"
+          cosign sign -y --new-bundle-format=false --key "$keydir/imported.key" "$IMAGE@$digest"
+          cosign verify --key build_files/kpfe-test-signing.pub "$IMAGE@$digest" > "$RUNNER_TEMP/evidence/signature.json"
+          jq -e --arg digest "$digest" --arg image "$IMAGE" 'any(.[];
+            .critical.image["docker-manifest-digest"] == $digest and
+            .critical.identity["docker-reference"] == $image)' "$RUNNER_TEMP/evidence/signature.json"
+          test "$TEST_TAG" = test-kpfe-desktop-policy-20260923
+          skopeo copy --all "docker://$IMAGE@$digest" "docker://$IMAGE:$TEST_TAG"
+          test "$(skopeo inspect --format '{{.Digest}}' "docker://$IMAGE:$TEST_TAG")" = "$digest"
+          jq -n --arg image "$IMAGE@$digest" --arg base "$BASE_IMAGE" \
+            --arg revision "$GITHUB_SHA" --arg version "$VERSION" --arg tag "$build_tag" \
+            --arg input_sha256 "$INPUT_SHA256" '{image:$image, base:$base, revision:$revision,
+              version:$version, build_tag:$tag, input_sha256:$input_sha256,
+              package_source:"543a4f12bd834897a9ec577c7a485080b19ca1df",
+              kernel_rebuilt:false, activation:"disabled"}' > "$RUNNER_TEMP/evidence/build.json"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          printf 'Signed test image: `%s@%s`\n\nNo installation or charging activation performed.\n' "$IMAGE" "$digest" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload build evidence
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: kpfe-charge-policy-build-info
-          path: ${{ runner.temp }}/kpfe-charge-policy-build-info/
-          if-no-files-found: error
+          name: kpfe-desktop-policy-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
           retention-days: 30
-
-  publish_disk:
-    name: Disk image
-    needs: build_push
-    if: >-
-      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging') &&
-      needs.build_push.outputs.channel != '' &&
-      github.event.repository.fork == false
-    permissions:
-      contents: read
-      packages: read
-    uses: ./.github/workflows/build-disk.yml
-    with:
-      tag: ${{ needs.build_push.outputs.tag }}
-      channel: ${{ needs.build_push.outputs.channel }}
-      publish_r2: true
-      image_digest: ${{ needs.build_push.outputs.digest }}
-      source_ref: ${{ needs.build_push.outputs.revision }}
-    secrets:
-      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}

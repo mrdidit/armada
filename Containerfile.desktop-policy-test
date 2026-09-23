@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+ARG CHUNKAH_IMAGE=quay.io/coreos/chunkah@sha256:ff8b8b466a942ec6000445d4001fc661e2fc5a952ad9ee29b4de9ab09d1d1708
+ARG BASE_IMAGE=ghcr.io/mrdidit/armada@sha256:3ad2d5de4575d8fffacc92a77aae6a382f9a0066818f5f99e8de3d35cb26313c
+
+FROM scratch AS ctx
+COPY build_files/install-charging-policy.py build_files/52-configure-os-release.sh /build_files/
+COPY policy-inputs/rpms/ /rpms/
+COPY policy-inputs/srpms/ /srpms/
+COPY policy-inputs/SHA256SUMS /SHA256SUMS
+
+FROM ${BASE_IMAGE} AS armada-rootfs
+ARG ARMADA_VERSION
+RUN --network=none \
+    --mount=type=bind,from=ctx,source=/,target=/ctx \
+    --mount=type=bind,from=ctx,source=/rpms,target=/charging-rpms \
+    --mount=type=tmpfs,dst=/tmp \
+    python3 /ctx/build_files/install-charging-policy.py && \
+    cp /usr/share/armada-charging/image-verification.json /run/src/evidence/ && \
+    install -d /usr/share/armada-charging/source-rpms && \
+    cp /ctx/srpms/*.src.rpm /usr/share/armada-charging/source-rpms/ && \
+    cp /ctx/SHA256SUMS /usr/share/armada-charging/package-inputs.sha256 && \
+    printf '%s\n' "${ARMADA_VERSION}" >/usr/lib/armada/version && \
+    /ctx/build_files/52-configure-os-release.sh && \
+    bootc container lint
+
+FROM ${CHUNKAH_IMAGE} AS chunkah
+ARG CHUNKAH_CONFIG_STR
+RUN --mount=from=armada-rootfs,target=/chunkah,ro \
+    /bin/bash -o pipefail -c ' \
+        chunkah build --verbose --compressed --compression-level 6 \
+            --arch arm64 --max-layers 128 --source-date-epoch 0 \
+            --prune /sysroot/ \
+            --label ostree.commit- --label ostree.final-diffid- \
+            --config-str "${CHUNKAH_CONFIG_STR}" \
+            --output oci:/run/src/chunked 2>&1 | tee /run/src/chunkah.log'
