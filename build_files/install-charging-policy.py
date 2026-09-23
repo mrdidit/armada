@@ -11,6 +11,7 @@ from pathlib import Path
 import platform
 import re
 import stat
+import struct
 import subprocess
 import sys
 
@@ -64,6 +65,8 @@ SYSTEMD_PATHS = (
     "/run/systemd/system", "/run/systemd/user",
 )
 HWDB_CACHE = "/etc/udev/hwdb.bin"
+HWDB_BASE_SHA256 = "ceb8bdbc0abc82fdadc2ea1c0bee324b6326b852e2310c980f7d9d9cc95dbee0"
+HWDB_REGENERATED_SHA256 = "06aed174be3a8235874bf7db3ff098e38bd4462953ade58a3db45bd644f2e0af"
 HWDB_GENERATOR = "/usr/bin/systemd-hwdb"
 HWDB_SOURCE_PATHS = (
     "/etc/udev/hwdb.d", "/run/udev/hwdb.d",
@@ -212,13 +215,31 @@ def capture_hwdb(root=Path("/")):
     cache = path_at(root, HWDB_CACHE)
     require(cache.is_file() and not cache.is_symlink(), "Expected a preexisting regular hwdb cache")
     metadata = cache.stat()
-    return {"cache": entry(cache), "times": (metadata.st_atime_ns, metadata.st_mtime_ns),
+    return {"cache": entry(cache), "bytes": cache.read_bytes(),
+            "times": (metadata.st_atime_ns, metadata.st_mtime_ns),
             "sources": hwdb_sources(root), "generator": hwdb_generator(root)}
 
 
-def restore_hwdb_metadata(before, root=Path("/")):
+def hwdb_header(data):
+    result = {"first_80_bytes": data[:80].hex()}
+    if len(data) >= 80 and data[:8] == b"KSLPHHRH":
+        result.update(tool_version=struct.unpack_from("<Q", data, 8)[0],
+                      value_entry_size=struct.unpack_from("<Q", data, 48)[0])
+    return result
+
+
+def verify_base_hwdb(before):
+    require(before["cache"]["sha256"] == HWDB_BASE_SHA256 and
+            hashlib.sha256(before["bytes"]).hexdigest() == HWDB_BASE_SHA256,
+            "Original hwdb cache does not match the pinned base")
+
+
+def restore_base_hwdb(before, root=Path("/")):
+    verify_base_hwdb(before)
     after = capture_hwdb(root)
     report = {"before": before["cache"], "regenerated": after["cache"],
+              "before_header": hwdb_header(before["bytes"]),
+              "regenerated_header": hwdb_header(after["bytes"]),
               "source_sha256": manifest_digest(before["sources"]),
               "generator_sha256": manifest_digest(before["generator"]),
               "generator_paths": sorted(before["generator"])}
@@ -226,10 +247,16 @@ def restore_hwdb_metadata(before, root=Path("/")):
     require(before["sources"] == after["sources"], "Hwdb sources changed; refusing cache restoration")
     require(before["generator"] == after["generator"], "Hwdb generator changed; refusing cache restoration")
     original = before["cache"]
-    require(original["sha256"] == after["cache"]["sha256"],
-            "Regenerated hwdb cache bytes changed; refusing restoration")
+    require(after["cache"]["sha256"] in (HWDB_BASE_SHA256, HWDB_REGENERATED_SHA256) and
+            hashlib.sha256(after["bytes"]).hexdigest() == after["cache"]["sha256"],
+            "Unexpected regenerated hwdb cache checksum; refusing restoration")
     cache = path_at(root, HWDB_CACHE)
-    # The stock hwdb RPM trigger atomically replaces the cache and can drop image xattrs.
+    # Retain the pinned base's device database, not a claim that both compilations are equivalent.
+    if after["cache"]["sha256"] != HWDB_BASE_SHA256:
+        with cache.open("wb") as stream:
+            stream.write(before["bytes"])
+            stream.flush()
+            os.fsync(stream.fileno())
     os.chown(cache, original["uid"], original["gid"], follow_symlinks=False)
     cache.chmod(stat.S_IMODE(original["mode"]))
     for name in set(os.listxattr(cache, follow_symlinks=False)) - set(original["xattrs"]):
@@ -240,7 +267,8 @@ def restore_hwdb_metadata(before, root=Path("/")):
     require(restored == original, "Hwdb cache metadata restoration was incomplete")
     os.utime(cache, ns=before["times"], follow_symlinks=False)
     return {**report, "restored": restored,
-            "metadata_restored": after["cache"] != original, "compiled_bytes_unchanged": True}
+            "base_cache_restored": after["cache"] != original,
+            "restored_header": hwdb_header(before["bytes"])}
 
 
 def verify_snapshots(before, after):
@@ -391,6 +419,7 @@ def install():
     before = snapshot()
     enabled_before = enablement_snapshot()
     hwdb_before = capture_hwdb()
+    verify_base_hwdb(hwdb_before)
     run(["rpm", "-Uvh", "--test", *paths])
     result = run(["rpm", "-Uvh", *paths])
     print(result.stdout, end="")
@@ -398,7 +427,7 @@ def install():
     run(["rpmdb", "--verifydb"])
     after_packages = parse_inventory(run(["rpm", "-qa", "--qf", QUERY_FORMAT]).stdout)
     verify_inventory(before_packages, after_packages)
-    hwdb = restore_hwdb_metadata(hwdb_before)
+    hwdb = restore_base_hwdb(hwdb_before)
     after = snapshot()
     verify_snapshots(before, after)
     require(enablement_snapshot() == enabled_before, "Systemd enablement changed")

@@ -86,6 +86,11 @@ class ImageChecks(unittest.TestCase):
             [], 0, "libc.so.6 => /usr/lib64/libc.so.6 (0x1234)\n", ""))
         command.start()
         self.addCleanup(command.stop)
+        for name, data in (("HWDB_BASE_SHA256", b"compiled cache"),
+                           ("HWDB_REGENERATED_SHA256", b"known regenerated cache")):
+            pinned = patch.object(image, name, image.hashlib.sha256(data).hexdigest())
+            pinned.start()
+            self.addCleanup(pinned.stop)
         return cache, source
 
     def test_hwdb_same_bytes_restore_original_mode_and_xattrs(self):
@@ -101,8 +106,8 @@ class ImageChecks(unittest.TestCase):
         cache.chmod(0o600)
         os.setxattr(cache, "user.extra", b"new")
         os.removexattr(source, "user.component")
-        result = image.restore_hwdb_metadata(before, self.root)
-        self.assertTrue(result["metadata_restored"])
+        result = image.restore_base_hwdb(before, self.root)
+        self.assertTrue(result["base_cache_restored"])
         self.assertEqual(image.entry(cache), before["cache"])
         self.assertEqual(cache.stat().st_mtime_ns, before["times"][1])
 
@@ -110,9 +115,38 @@ class ImageChecks(unittest.TestCase):
         cache, _ = self.hwdb_fixture()
         before = image.capture_hwdb(self.root)
         cache.write_text("different compiled bytes")
-        with self.assertRaisesRegex(image.VerificationError, "cache bytes changed"):
-            image.restore_hwdb_metadata(before, self.root)
+        with self.assertRaisesRegex(image.VerificationError, "Unexpected regenerated hwdb cache"):
+            image.restore_base_hwdb(before, self.root)
         self.assertEqual(cache.read_text(), "different compiled bytes")
+
+    def test_hwdb_known_regeneration_restores_exact_base_bytes(self):
+        cache, _ = self.hwdb_fixture()
+        before = image.capture_hwdb(self.root)
+        cache.write_bytes(b"known regenerated cache")
+        result = image.restore_base_hwdb(before, self.root)
+        self.assertEqual(cache.read_bytes(), b"compiled cache")
+        self.assertEqual(image.entry(cache), before["cache"])
+        self.assertTrue(result["base_cache_restored"])
+        self.assertNotIn("compiled_bytes_unchanged", result)
+        self.assertNotEqual(result["before"]["sha256"], result["regenerated"]["sha256"])
+
+    def test_hwdb_unpinned_original_or_corrupted_backup_is_refused(self):
+        cache, _ = self.hwdb_fixture()
+        before = image.capture_hwdb(self.root)
+        before["bytes"] = b"corrupted backup"
+        with self.assertRaisesRegex(image.VerificationError, "pinned base"):
+            image.restore_base_hwdb(before, self.root)
+        cache.write_bytes(b"unpinned original")
+        before = image.capture_hwdb(self.root)
+        with self.assertRaisesRegex(image.VerificationError, "pinned base"):
+            image.restore_base_hwdb(before, self.root)
+
+    def test_hwdb_header_records_format_without_equivalence_claim(self):
+        data = image.struct.pack("<8s9Q", b"KSLPHHRH", 259, 80, 80, 24, 16, 32, 0, 0, 0)
+        header = image.hwdb_header(data)
+        self.assertEqual(header["tool_version"], 259)
+        self.assertEqual(header["value_entry_size"], 32)
+        self.assertEqual(header["first_80_bytes"], data.hex())
 
     def test_hwdb_changed_source_and_generator_are_refused(self):
         _, source = self.hwdb_fixture()
@@ -123,7 +157,7 @@ class ImageChecks(unittest.TestCase):
                 before = image.capture_hwdb(self.root)
                 path.write_text("changed")
                 with self.assertRaises(image.VerificationError):
-                    image.restore_hwdb_metadata(before, self.root)
+                    image.restore_base_hwdb(before, self.root)
                 path.write_text(original)
 
     def test_hwdb_source_mode_change_is_refused(self):
@@ -131,7 +165,7 @@ class ImageChecks(unittest.TestCase):
         before = image.capture_hwdb(self.root)
         source.chmod(0o600)
         with self.assertRaisesRegex(image.VerificationError, "sources changed"):
-            image.restore_hwdb_metadata(before, self.root)
+            image.restore_base_hwdb(before, self.root)
 
     def test_hwdb_source_link_target_contents_are_checked(self):
         _, source = self.hwdb_fixture()
@@ -141,25 +175,25 @@ class ImageChecks(unittest.TestCase):
         before = image.capture_hwdb(self.root)
         target.write_text("changed")
         with self.assertRaisesRegex(image.VerificationError, "sources changed"):
-            image.restore_hwdb_metadata(before, self.root)
+            image.restore_base_hwdb(before, self.root)
 
     def test_hwdb_missing_and_symlink_cache_are_refused(self):
         cache, _ = self.hwdb_fixture()
         before = image.capture_hwdb(self.root)
         cache.unlink()
         with self.assertRaisesRegex(image.VerificationError, "regular hwdb cache"):
-            image.restore_hwdb_metadata(before, self.root)
+            image.restore_base_hwdb(before, self.root)
         target = self.write("/cache-target", "compiled cache")
         cache.symlink_to(target)
         with self.assertRaisesRegex(image.VerificationError, "regular hwdb cache"):
-            image.restore_hwdb_metadata(before, self.root)
+            image.restore_base_hwdb(before, self.root)
 
     def test_hwdb_new_search_directory_is_refused(self):
         self.hwdb_fixture()
         before = image.capture_hwdb(self.root)
         self.write("/run/udev/hwdb.d/override.hwdb", "override")
         with self.assertRaisesRegex(image.VerificationError, "sources changed"):
-            image.restore_hwdb_metadata(before, self.root)
+            image.restore_base_hwdb(before, self.root)
 
     def test_only_exact_configuration_additions_are_allowed(self):
         self.write("/etc/existing")
@@ -349,7 +383,8 @@ class ImageChecks(unittest.TestCase):
         for name in ("verify_environment", "verify_kernel", "verify_disabled"):
             stack.enter_context(patch.object(image, name))
         stack.enter_context(patch.object(image, "capture_hwdb", return_value={}))
-        stack.enter_context(patch.object(image, "restore_hwdb_metadata", return_value={}))
+        stack.enter_context(patch.object(image, "verify_base_hwdb"))
+        stack.enter_context(patch.object(image, "restore_base_hwdb", return_value={}))
         paths = [str(image.RPM_DIRECTORY / item[0]) for item in image.PACKAGES.values()]
         stack.enter_context(patch.object(image, "verify_inputs", return_value=paths))
         before = {"/etc/retained": {"sha256": "same"}}
