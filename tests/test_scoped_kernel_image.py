@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 from contextlib import contextmanager, redirect_stdout
 from copy import deepcopy
+import errno
 import hashlib
 import importlib.util
 import io
@@ -154,6 +155,74 @@ class ScopedKernelChecks(unittest.TestCase):
         with patch.object(image, "package_stream", side_effect=lambda _: self.archive({"vmlinuz": b"bad"})):
             with self.assertRaises(image.VerificationError):
                 image.replace_tree(Path("unused"), {"vmlinuz": "wrong"}, self.root)
+        self.assertEqual(old.read_bytes(), b"old")
+        self.assertEqual({path.name for path in old.parent.parent.iterdir()}, {image.RELEASE})
+
+    def test_overlay_exdev_copies_backup_with_symlinks_before_removing_exact_target(self):
+        old = self.write(image.TARGET + "/old-module.ko", b"old")
+        outside = self.write("/outside", b"untouched")
+        (old.parent / "link").symlink_to(outside)
+        original_rename, original_copytree = Path.rename, image.shutil.copytree
+        def rename(path, destination):
+            if path == old.parent:
+                raise OSError(errno.EXDEV, "overlay lower directory")
+            return original_rename(path, destination)
+        def backup(source, destination, **kwargs):
+            self.assertEqual(source, old.parent)
+            self.assertEqual(kwargs, {"symlinks": True})
+            result = original_copytree(source, destination, **kwargs)
+            self.assertEqual((destination / "old-module.ko").read_bytes(), b"old")
+            self.assertTrue((destination / "link").is_symlink())
+            self.assertTrue(old.exists())
+            return result
+        payload = {"vmlinuz": b"new"}
+        with patch.object(image, "package_stream", side_effect=lambda _: self.archive(payload)), \
+                patch.object(Path, "rename", rename), patch.object(image.shutil, "copytree", side_effect=backup) as copied:
+            image.replace_tree(Path("unused"), {"vmlinuz": hashlib.sha256(b"new").hexdigest()}, self.root)
+            copied.assert_called_once()
+        self.assertFalse(old.exists())
+        self.assertEqual((old.parent / "vmlinuz").read_bytes(), b"new")
+        self.assertEqual(outside.read_bytes(), b"untouched")
+        self.assertEqual({path.name for path in old.parent.parent.iterdir()}, {image.RELEASE})
+
+    def test_non_exdev_rename_failure_does_not_copy_or_remove_old_target(self):
+        old = self.write(image.TARGET + "/old-module.ko", b"old")
+        with patch.object(image, "package_stream", side_effect=lambda _: self.archive({"vmlinuz": b"new"})), \
+                patch.object(Path, "rename", side_effect=PermissionError(errno.EACCES, "denied")), \
+                patch.object(image.shutil, "copytree") as copied:
+            with self.assertRaises(PermissionError):
+                image.replace_tree(Path("unused"), {"vmlinuz": hashlib.sha256(b"new").hexdigest()}, self.root)
+            copied.assert_not_called()
+        self.assertEqual(old.read_bytes(), b"old")
+        self.assertEqual({path.name for path in old.parent.parent.iterdir()}, {image.RELEASE})
+
+    def test_exdev_failed_backup_keeps_original_tree(self):
+        old = self.write(image.TARGET + "/old-module.ko", b"old")
+        def failed_backup(source, destination, **kwargs):
+            destination.mkdir()
+            (destination / "partial").write_bytes(b"partial")
+            raise OSError(errno.ENOSPC, "backup full")
+        with patch.object(image, "package_stream", side_effect=lambda _: self.archive({"vmlinuz": b"new"})), \
+                patch.object(Path, "rename", side_effect=OSError(errno.EXDEV, "overlay lower directory")), \
+                patch.object(image.shutil, "copytree", side_effect=failed_backup):
+            with self.assertRaisesRegex(OSError, "backup full"):
+                image.replace_tree(Path("unused"), {"vmlinuz": hashlib.sha256(b"new").hexdigest()}, self.root)
+        self.assertEqual(old.read_bytes(), b"old")
+        self.assertEqual({path.name for path in old.parent.parent.iterdir()}, {image.RELEASE})
+
+    def test_exdev_backup_is_restored_if_replacement_rename_fails(self):
+        old = self.write(image.TARGET + "/old-module.ko", b"old")
+        original_rename = Path.rename
+        def rename(path, destination):
+            if path == old.parent:
+                raise OSError(errno.EXDEV, "overlay lower directory")
+            if path.name == image.RELEASE:
+                raise OSError(errno.EIO, "replacement failed")
+            return original_rename(path, destination)
+        with patch.object(image, "package_stream", side_effect=lambda _: self.archive({"vmlinuz": b"new"})), \
+                patch.object(Path, "rename", rename):
+            with self.assertRaisesRegex(OSError, "replacement failed"):
+                image.replace_tree(Path("unused"), {"vmlinuz": hashlib.sha256(b"new").hexdigest()}, self.root)
         self.assertEqual(old.read_bytes(), b"old")
         self.assertEqual({path.name for path in old.parent.parent.iterdir()}, {image.RELEASE})
 

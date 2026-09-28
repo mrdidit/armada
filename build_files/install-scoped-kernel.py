@@ -4,6 +4,7 @@
 
 from contextlib import contextmanager
 import argparse
+import errno
 import gzip
 import hashlib
 import importlib.util
@@ -279,7 +280,13 @@ def replace_tree(archive, files, root=Path("/")):
         replacement.mkdir()
         extract_verified(archive, replacement, files)
         previous = stage / "previous"
-        target.rename(previous)
+        try:
+            target.rename(previous)
+        except OSError as error:
+            if error.errno != errno.EXDEV:
+                raise
+            shutil.copytree(target, previous, symlinks=True)
+            shutil.rmtree(target)
         try:
             replacement.rename(target)
         except OSError:
