@@ -69,7 +69,12 @@ jobs:
       - name: Install image tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y buildah skopeo jq openssl
+          sudo apt-get install -y buildah skopeo jq openssl binutils zstd
+      - name: Verify kernel package with build-only ELF tools
+        run: |
+          set -euo pipefail
+          python3 -B build_files/install-scoped-kernel.py --verify-package \
+            policy-inputs/kernel/armada-kernel-7.2.3.tar.zst kernel-inputs > kernel-verification.json
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: v2.6.3
@@ -78,6 +83,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir "$RUNNER_TEMP/evidence"
+          cp kernel-verification.json "$RUNNER_TEMP/evidence/kernel-package-verification.json"
           cosign verify --key build_files/kpfe-test-signing.pub "$BASE_IMAGE" > "$RUNNER_TEMP/evidence/base-signature.json"
           skopeo inspect --override-arch arm64 --config "docker://$BASE_IMAGE" > "$RUNNER_TEMP/evidence/base-config.json"
           jq -e '.architecture == "arm64" and .os == "linux" and .config.Cmd == ["/sbin/init"]' "$RUNNER_TEMP/evidence/base-config.json"

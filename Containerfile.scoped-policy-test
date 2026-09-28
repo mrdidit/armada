@@ -6,6 +6,7 @@ FROM scratch AS ctx
 COPY build_files/install-charging-policy.py build_files/install-scoped-kernel.py build_files/52-configure-os-release.sh build_files/55-generate-initramfs.sh /build_files/
 COPY policy-inputs/ /inputs/
 COPY kernel-inputs/ /kernel-inputs/
+COPY kernel-verification.json /kernel-verification.json
 
 FROM ${BASE_IMAGE} AS armada-rootfs
 ARG ARMADA_VERSION

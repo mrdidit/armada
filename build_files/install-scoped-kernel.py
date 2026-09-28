@@ -3,6 +3,7 @@
 """Replace only the reviewed kernel tree in an offline ARM64 image build."""
 
 from contextlib import contextmanager
+import argparse
 import gzip
 import hashlib
 import importlib.util
@@ -41,12 +42,18 @@ PREFIX = f"lib/modules/{RELEASE}/"
 ARCHIVE = Path(f"/packages/kernel/armada-kernel-{RELEASE}.tar.zst")
 ARCHIVE_SHA256 = "0814bed69d64a188db231e3c927156ad40d5d02a1db98e7cd900cc5943c48148"
 INPUTS = Path("/ctx/kernel-inputs")
+VERIFICATION_PATH = Path("/ctx/kernel-verification.json")
 PATCH_SHA256 = "d6e3fd90a18270675bf03e96880d8be6ba72e2981742bbad3bd433dcbe35fa36"
 VERIFIER_SHA256 = "f17fb4680db8b74490077b565013cc21bff6ca7f8afc0c861e4effe742b1f16c"
 HELPER = Path("/ctx/build_files/55-generate-initramfs.sh")
 HELPER_SHA256 = "00130f359e7fb307a014e90246b6ce5d26b20770e154c0e024239ae3ee6836b0"
 EVIDENCE_PATH = Path("/usr/share/armada-charging/kernel-image-verification.json")
 MODULE = "kernel/drivers/power/supply/qcom_battmgr.ko"
+PATCH = "0950-power-supply-qcom-battmgr-kpfe-charge-policy.patch"
+METADATA = (".armada-source", "modules.order", "modules.builtin", "modules.dep", "modules.alias")
+WORKERS = ("qcom_battmgr_kpfe_charge_worker", "qcom_battmgr_kpfe_charge_rearm_worker")
+VERMAGIC = "7.2.3 SMP preempt mod_unload aarch64"
+NOT_VALIDATED = ["deployment", "bootability", "firmware RPC semantics", "hardware behavior"]
 PINNED_FILES = {
     "vmlinuz": "8f08d255b351fa61468914bb555a83e07d584a1128e9b5df946453056d7fa073",
     MODULE: "24c67ead5ffe3c5f7b2fbd38bb51acecc405b5f99e187187462ba3451eb9f813",
@@ -102,18 +109,92 @@ def validate_inventory(files):
     return {"modules": len(modules), "dtbs": len(dtbs), "files": len(files)}
 
 
-def verify_package(archive=ARCHIVE, inputs=INPUTS):
-    check_archive_pin(archive)
+def package_verifier(inputs):
     verifier_path = inputs / "verify-kpfe-kernel-package.py"
     regular_file(verifier_path)
     require(policy.sha256(verifier_path) == VERIFIER_SHA256, "Original package verifier changed")
     verifier = load_module("reviewed_kernel_package", verifier_path)
     verifier.PATCH_SHA256 = PATCH_SHA256
+    return verifier
+
+
+def verify_package(archive=ARCHIVE, inputs=INPUTS):
+    check_archive_pin(archive)
+    verifier = package_verifier(inputs)
     report = verifier.verify(archive, inputs / "kernel")
     files, _ = verifier.read_package(archive)
     counts = validate_inventory(files)
     require(report["modules"] == counts["modules"] and len(report["dtbs_sha256"]) == counts["dtbs"],
             "Package verifier inventory differs")
+    return report, files
+
+
+def expected_report(files):
+    counts = validate_inventory(files)
+    require(all(name in files for name in METADATA), "Receipt is missing required kernel metadata")
+    return {
+        "status": "PASS", "scope": "package-consistency-only", "release": RELEASE,
+        "archive_sha256": ARCHIVE_SHA256, "patch_0950_sha256": PATCH_SHA256,
+        "vmlinuz_sha256": PINNED_FILES["vmlinuz"], "qcom_battmgr_sha256": PINNED_FILES[MODULE],
+        "vermagic": VERMAGIC, "worker_symbols": list(WORKERS), "modules": counts["modules"],
+        "dtbs_sha256": {PurePosixPath(name).name: digest for name, digest in files.items() if name.endswith(".dtb")},
+        "metadata_sha256": {name: files[name] for name in METADATA}, "not_validated": NOT_VALIDATED,
+    }
+
+
+def package_receipt(archive, inputs):
+    source_hashes = input_hashes(inputs)
+    report, files = verify_package(archive, inputs)
+    require(report == expected_report(files), "Full package verification report differs from pinned expectations")
+    require(source_hashes == input_hashes(inputs), "Kernel build inputs changed during full verification")
+    return {
+        "schema_version": 1, "status": "PASS", "archive_sha256": ARCHIVE_SHA256,
+        "patch_0950_sha256": PATCH_SHA256, "verifier_sha256": VERIFIER_SHA256,
+        "producer_sha256": policy.sha256(Path(__file__)), "package_verification": report,
+        "counts": validate_inventory(files), "files_sha256": files,
+        "kernel_build_inputs_sha256": source_hashes,
+    }
+
+
+def unique_object(pairs):
+    result = {}
+    for name, value in pairs:
+        require(name not in result, f"Duplicate verification receipt key: {name}")
+        result[name] = value
+    return result
+
+
+def validate_receipt(receipt, source_hashes):
+    fields = {"schema_version", "status", "archive_sha256", "patch_0950_sha256", "verifier_sha256",
+              "producer_sha256", "package_verification", "counts", "files_sha256", "kernel_build_inputs_sha256"}
+    require(isinstance(receipt, dict) and set(receipt) == fields and
+            type(receipt["schema_version"]) is int and receipt["schema_version"] == 1,
+            "Invalid package verification receipt schema")
+    require(receipt["status"] == "PASS" and receipt["archive_sha256"] == ARCHIVE_SHA256 and
+            receipt["patch_0950_sha256"] == PATCH_SHA256 and receipt["verifier_sha256"] == VERIFIER_SHA256 and
+            receipt["producer_sha256"] == policy.sha256(Path(__file__)), "Stale or failed package verification receipt")
+    require(receipt["kernel_build_inputs_sha256"] == source_hashes and
+            source_hashes.get("verify-kpfe-kernel-package.py") == VERIFIER_SHA256 and
+            source_hashes.get("kernel/patches/" + PATCH) == PATCH_SHA256,
+            "Package verification receipt source inputs differ")
+    files = receipt["files_sha256"]
+    require(isinstance(files, dict) and files and
+            all(isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) for digest in files.values()),
+            "Invalid package verification receipt file hashes")
+    require(receipt["counts"] == validate_inventory(files) and
+            receipt["package_verification"] == expected_report(files),
+            "Package verification receipt report/inventory differs")
+    return receipt["package_verification"], files
+
+
+def load_verified_package(archive=ARCHIVE, inputs=INPUTS, receipt_path=VERIFICATION_PATH):
+    regular_file(receipt_path)
+    receipt = json.loads(receipt_path.read_text(), object_pairs_hook=unique_object)
+    check_archive_pin(archive)
+    report, files = validate_receipt(receipt, input_hashes(inputs))
+    actual, _ = package_verifier(inputs).read_package(archive)
+    validate_inventory(actual)
+    require(actual == files, "Current archive inventory differs from full verification receipt")
     return report, files
 
 
@@ -324,7 +405,8 @@ def install():
     regular_file(HELPER)
     require(policy.sha256(HELPER) == HELPER_SHA256, "Existing initramfs helper changed")
     source_hashes = input_hashes()
-    report, files = verify_package()
+    report, files = load_verified_package()
+    receipt_sha256 = policy.sha256(VERIFICATION_PATH)
     protected_paths = (*policy.PROTECTED_PATHS, *policy.INTEGRATION_FILES,
                        "/usr/lib/systemd/system/armada-charging.service", str(policy.EVIDENCE_PATH))
     before = policy.snapshot(names=protected_paths)
@@ -347,12 +429,14 @@ def install():
             "RPM inventory changed during kernel operation")
     policy.verify_disabled()
     require(source_hashes == input_hashes(), "Kernel build inputs changed during installation")
+    require(policy.sha256(VERIFICATION_PATH) == receipt_sha256, "Package verification receipt changed during installation")
     evidence = {
         "schema_version": 1, "result": "disabled-scoped-kernel-image-verified",
         "base_image": policy.BASE_IMAGE, "release": RELEASE, "archive_sha256": ARCHIVE_SHA256,
         "archive_manifest_sha256": policy.manifest_digest(files), "package_verification": report,
         "counts": validate_inventory(files), "installed_sha256": installed, "initramfs": initramfs,
         "kernel_build_inputs_sha256": source_hashes,
+        "package_verification_receipt_sha256": receipt_sha256,
         "image_build_inputs_sha256": {str(path): policy.sha256(path) for path in
                                       (Path(__file__), POLICY_PATH, HELPER)},
         "package_evidence_sha256": policy.sha256(policy.EVIDENCE_PATH),
@@ -365,7 +449,7 @@ def install():
         "firmware_boot_machinery_system_configuration_unchanged": True,
         "kernel_replaced": True, "kernel_compiled_in_image_build": False, "initramfs_regenerated": True,
         "charging_enabled": False, "hardware_validated": False, "enablement_receipt": "not-generated",
-        "not_validated": ["deployment", "bootability", "firmware RPC semantics", "hardware behavior"],
+        "not_validated": NOT_VALIDATED,
     }
     with EVIDENCE_PATH.open("x") as stream:
         json.dump(evidence, stream, indent=2, sort_keys=True)
@@ -374,8 +458,19 @@ def install():
     print(f"Verified disabled scoped kernel image: {EVIDENCE_PATH}")
 
 
+def main(arguments=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--verify-package", nargs=2, type=Path, metavar=("ARCHIVE", "INPUTS"),
+                        help="run full package verification on the build runner and emit its receipt")
+    args = parser.parse_args(arguments)
+    if args.verify_package:
+        print(json.dumps(package_receipt(*args.verify_package), indent=2, sort_keys=True))
+    else:
+        install()
+
+
 if __name__ == "__main__":
     try:
-        install()
+        main()
     except (VerificationError, OSError, ValueError, tarfile.TarError, subprocess.SubprocessError) as error:
         sys.exit(f"Scoped kernel image verification failed: {error}")

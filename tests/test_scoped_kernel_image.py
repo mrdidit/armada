@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
+from copy import deepcopy
 import hashlib
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tarfile
 import tempfile
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 SPEC = importlib.util.spec_from_file_location(
@@ -234,6 +237,102 @@ class ScopedKernelChecks(unittest.TestCase):
         verifier = image.load_module("fixture_verifier", path)
         verifier.PATCH_SHA256 = "reviewed"
         self.assertEqual(image.input_hashes(self.root / "inputs"), before)
+
+    def receipt(self):
+        files = {name: image.PINNED_FILES.get(name, "a" * 64) for name in self.inventory()}
+        files.update({name: "b" * 64 for name in image.METADATA})
+        sources = {"verify-kpfe-kernel-package.py": image.VERIFIER_SHA256,
+                   "kernel/patches/" + image.PATCH: image.PATCH_SHA256}
+        return {
+            "schema_version": 1, "status": "PASS", "archive_sha256": image.ARCHIVE_SHA256,
+            "patch_0950_sha256": image.PATCH_SHA256, "verifier_sha256": image.VERIFIER_SHA256,
+            "producer_sha256": image.policy.sha256(Path(image.__file__)),
+            "package_verification": image.expected_report(files), "counts": image.validate_inventory(files),
+            "files_sha256": files, "kernel_build_inputs_sha256": sources,
+        }
+
+    def test_receipt_requires_success_pins_and_exact_report(self):
+        good = self.receipt()
+        image.validate_receipt(good, good["kernel_build_inputs_sha256"])
+        for key, value in (("schema_version", True), ("status", "FAIL"), ("archive_sha256", "old"),
+                           ("patch_0950_sha256", "old"), ("verifier_sha256", "old"),
+                           ("producer_sha256", "old"), ("counts", {"modules": 1618, "dtbs": 25})):
+            receipt = deepcopy(good)
+            receipt[key] = value
+            with self.subTest(key=key), self.assertRaises(image.VerificationError):
+                image.validate_receipt(receipt, good["kernel_build_inputs_sha256"])
+        for key, value in (("status", "FAIL"), ("scope", "hardware-verified"), ("release", "7.2.4"),
+                           ("vermagic", "7.2.3 x86_64"), ("worker_symbols", []), ("modules", 1618),
+                           ("vmlinuz_sha256", "old"), ("qcom_battmgr_sha256", "old"),
+                           ("dtbs_sha256", {}), ("metadata_sha256", {}), ("not_validated", [])):
+            receipt = deepcopy(good)
+            receipt["package_verification"][key] = value
+            with self.subTest(report_key=key), self.assertRaises(image.VerificationError):
+                image.validate_receipt(receipt, good["kernel_build_inputs_sha256"])
+        with self.assertRaises(image.VerificationError):
+            image.validate_receipt([], good["kernel_build_inputs_sha256"])
+
+    def test_receipt_rejects_changed_inputs_missing_files_or_invalid_hashes(self):
+        good = self.receipt()
+        with self.assertRaisesRegex(image.VerificationError, "source inputs"):
+            image.validate_receipt(good, {**good["kernel_build_inputs_sha256"], "kernel/changed": "c" * 64})
+        for name, value in ((image.MODULE, None), ("modules.order", None),
+                            ("kernel/test/module0.ko", "invalid"), (image.MODULE, "c" * 64)):
+            receipt = deepcopy(good)
+            if value is None:
+                receipt["files_sha256"].pop(name)
+            else:
+                receipt["files_sha256"][name] = value
+            with self.subTest(name=name, value=value), self.assertRaises(image.VerificationError):
+                image.validate_receipt(receipt, good["kernel_build_inputs_sha256"])
+
+    def test_receipt_consumer_rechecks_archive_and_all_files_without_readelf(self):
+        receipt = self.receipt()
+        path = self.write("/receipt.json", json.dumps(receipt).encode())
+        archive, inputs = self.root / "archive.tar.zst", self.root / "inputs"
+        reader = Mock(return_value=(receipt["files_sha256"], {}))
+        verifier = SimpleNamespace(read_package=reader, verify=Mock(side_effect=AssertionError("readelf forbidden")))
+        with patch.object(image, "check_archive_pin") as pin, \
+                patch.object(image, "input_hashes", return_value=receipt["kernel_build_inputs_sha256"]), \
+                patch.object(image, "package_verifier", return_value=verifier), \
+                patch.object(image, "verify_package", side_effect=AssertionError("full verification forbidden")):
+            self.assertEqual(image.load_verified_package(archive, inputs, path),
+                             (receipt["package_verification"], receipt["files_sha256"]))
+            pin.assert_called_once_with(archive)
+            reader.assert_called_once_with(archive)
+            verifier.verify.assert_not_called()
+            reader.return_value = ({**receipt["files_sha256"], "kernel/test/module0.ko": "c" * 64}, {})
+            with self.assertRaisesRegex(image.VerificationError, "Current archive inventory"):
+                image.load_verified_package(archive, inputs, path)
+            pin.side_effect = image.VerificationError("stale archive")
+            with self.assertRaisesRegex(image.VerificationError, "stale archive"):
+                image.load_verified_package(archive, inputs, path)
+
+    def test_missing_invalid_or_duplicate_receipt_has_no_fallback(self):
+        path = self.root / "receipt.json"
+        with patch.object(image, "verify_package", side_effect=AssertionError("fallback forbidden")):
+            with self.assertRaisesRegex(image.VerificationError, "regular file"):
+                image.load_verified_package(receipt_path=path)
+            path.write_text('{"status":"PASS","status":"FAIL"}')
+            with self.assertRaisesRegex(image.VerificationError, "Duplicate"):
+                image.load_verified_package(receipt_path=path)
+            path.write_text("not json")
+            with self.assertRaises(ValueError):
+                image.load_verified_package(receipt_path=path)
+
+    def test_runner_receipt_calls_full_verification_and_cli_does_not_install(self):
+        receipt = self.receipt()
+        archive, inputs = self.root / "archive.tar.zst", self.root / "inputs"
+        with patch.object(image, "verify_package", return_value=(receipt["package_verification"], receipt["files_sha256"])) as full, \
+                patch.object(image, "input_hashes", return_value=receipt["kernel_build_inputs_sha256"]):
+            self.assertEqual(image.package_receipt(archive, inputs), receipt)
+            full.assert_called_once_with(archive, inputs)
+        output = io.StringIO()
+        with patch.object(image, "package_receipt", return_value=receipt) as verify, \
+                patch.object(image, "install", side_effect=AssertionError("installation forbidden")), redirect_stdout(output):
+            image.main(["--verify-package", str(archive), str(inputs)])
+            verify.assert_called_once_with(archive, inputs)
+        self.assertEqual(json.loads(output.getvalue()), receipt)
 
     def test_installed_tree_allows_only_depmod_metadata_and_new_initramfs(self):
         files = {"vmlinuz": b"kernel", image.MODULE: b"module", "modules.dep": b"dependency"}

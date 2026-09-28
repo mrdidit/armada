@@ -36,7 +36,10 @@ with the corrected patch; private investigation archives are not included.
 The assembly/signing pattern and retained scripts derive from fork revision
 `ad955153c825b2b75e11db67b1c1e7ef12bc225e`. The original verifier in the kernel
 input archive remains unchanged; its expected charging-patch hash is adapted
-in memory for package verification.
+in memory for package verification. ELF/symbol verification runs on the Actions
+runner; image assembly rechecks its receipt against the pinned archive, complete
+file inventory and source-input hashes. Build-only ELF tools are not installed
+in the resulting image.
 
 Installation is separate. Use the independently verified image digest and
 retain a known-good deployment for rollback. This workflow neither accesses
