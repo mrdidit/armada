@@ -1,22 +1,22 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-name: Assemble KPFE desktop policy test
+name: Assemble KPFE scoped charging policy test
 on:
   workflow_dispatch:
 
 permissions: {}
 concurrency:
-  group: kpfe-desktop-policy-test
+  group: kpfe-scoped-policy-test
   cancel-in-progress: false
 
 env:
   BASE_IMAGE: ghcr.io/mrdidit/armada@sha256:3ad2d5de4575d8fffacc92a77aae6a382f9a0066818f5f99e8de3d35cb26313c
   IMAGE: ghcr.io/mrdidit/armada
-  TEST_TAG: test-kpfe-desktop-policy-20260923
-  INPUT_SHA256: a66e1d8cca4b220639fa19ce1bc0586fb1950d3163089b4bba239c5d4c2567fc
+  TEST_TAG: test-kpfe-scoped-policy-20260928
+  INPUT_SHA256: 57282fa6f1d6704d0d1289445dbdbad39a5827741e5c5fea4a74cbcf8ac42a98
 
 jobs:
   inputs:
-    if: github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-kpfe-desktop-policy-20260923'
+    if: github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-kpfe-scoped-policy-20260928'
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: write # GitHub restricts draft-release visibility to push access.
@@ -26,14 +26,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh api repos/mrdidit/armada/releases/394610908 |
-            jq -e '.draft == true and .tag_name == "kpfe-desktop-policy-inputs-20260923"'
+          gh api repos/mrdidit/armada/releases/398136818 |
+            jq -e '.draft == true and .tag_name == "kpfe-scoped-policy-inputs-20260928"'
           gh api -H 'Accept: application/octet-stream' \
-            repos/mrdidit/armada/releases/assets/583676230 > inputs.tar.gz
+            repos/mrdidit/armada/releases/assets/595107014 > inputs.tar.gz
           printf '%s  inputs.tar.gz\n' "$INPUT_SHA256" | sha256sum -c -
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: desktop-policy-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          name: scoped-policy-inputs-${{ github.run_id }}-${{ github.run_attempt }}
           path: inputs.tar.gz
           retention-days: 7
           if-no-files-found: error
@@ -57,17 +57,15 @@ jobs:
         run: |
           set -euo pipefail
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
-            --name "desktop-policy-inputs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --dir "$RUNNER_TEMP/input"
+            --name "scoped-policy-inputs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --dir "$RUNNER_TEMP/input"
           cd "$RUNNER_TEMP/input"
           printf '%s  inputs.tar.gz\n' "$INPUT_SHA256" | sha256sum -c -
-          mkdir "$GITHUB_WORKSPACE/policy-inputs"
-          tar -xzf inputs.tar.gz --no-same-owner -C "$GITHUB_WORKSPACE/policy-inputs"
+          python3 "$GITHUB_WORKSPACE/build_files/prepare-scoped-image-inputs.py" \
+            inputs.tar.gz "$GITHUB_WORKSPACE/policy-inputs" "$GITHUB_WORKSPACE/kernel-inputs"
           cd "$GITHUB_WORKSPACE/policy-inputs"
           sha256sum -c SHA256SUMS
-          test "$(find rpms -type f | wc -l)" -eq 4
-          test "$(find srpms -type f | wc -l)" -eq 3
       - name: Check local assembly tests
-        run: python3 -B -m unittest discover -s tests -p test_charging_image.py -v
+        run: python3 -B -m unittest discover -s tests -p 'test_*image*.py' -v
       - name: Install image tools
         run: |
           sudo apt-get update
@@ -83,15 +81,15 @@ jobs:
           cosign verify --key build_files/kpfe-test-signing.pub "$BASE_IMAGE" > "$RUNNER_TEMP/evidence/base-signature.json"
           skopeo inspect --override-arch arm64 --config "docker://$BASE_IMAGE" > "$RUNNER_TEMP/evidence/base-config.json"
           jq -e '.architecture == "arm64" and .os == "linux" and .config.Cmd == ["/sbin/init"]' "$RUNNER_TEMP/evidence/base-config.json"
-          version="20260923.policy.${GITHUB_SHA:0:7}"
+          version="20260928.scoped.${GITHUB_SHA:0:7}"
           jq --arg version "$version" --arg revision "$GITHUB_SHA" --arg base "$BASE_IMAGE" '
             .config |
             .Labels["org.opencontainers.image.version"] = $version |
             .Labels["org.opencontainers.image.revision"] = $revision |
             .Labels["org.opencontainers.image.created"] = (now | todateiso8601) |
-            .Labels["org.opencontainers.image.description"] = "KPFE disabled charging-policy and KDE integration test" |
+            .Labels["org.opencontainers.image.description"] = "KPFE scoped charging kernel and persistent policy test" |
             .Labels["org.opencontainers.image.source"] = ("https://github.com/mrdidit/armada/tree/" + $revision) |
-            .Labels["org.opencontainers.image.documentation"] = ("https://github.com/mrdidit/armada/blob/" + $revision + "/docs/KPFE-DESKTOP-POLICY-TEST.md") |
+            .Labels["org.opencontainers.image.documentation"] = ("https://github.com/mrdidit/armada/blob/" + $revision + "/docs/KPFE-SCOPED-POLICY-TEST.md") |
             .Labels["org.opencontainers.image.base.digest"] = ($base | split("@")[1]) |
             del(.Labels["ostree.commit"], .Labels["ostree.final-diffid"])' \
             "$RUNNER_TEMP/evidence/base-config.json" > "$RUNNER_TEMP/evidence/runtime-config.json"
@@ -117,7 +115,7 @@ jobs:
             --security-opt label=disable --volume "$RUNNER_TEMP:/run/src" \
             --build-arg "BASE_IMAGE=$BASE_IMAGE" --build-arg "ARMADA_VERSION=$VERSION" \
             --build-arg "CHUNKAH_CONFIG_STR=$(jq -c . "$RUNNER_TEMP/evidence/runtime-config.json")" \
-            -f Containerfile.desktop-policy-test -t localhost/kpfe-policy-assembly .
+            -f Containerfile.scoped-policy-test -t localhost/kpfe-policy-assembly .
       - name: Verify serialized image
         run: |
           set -euo pipefail
@@ -160,22 +158,24 @@ jobs:
           jq -e --arg digest "$digest" --arg image "$IMAGE" 'any(.[];
             .critical.image["docker-manifest-digest"] == $digest and
             .critical.identity["docker-reference"] == $image)' "$RUNNER_TEMP/evidence/signature.json"
-          test "$TEST_TAG" = test-kpfe-desktop-policy-20260923
+          test "$TEST_TAG" = test-kpfe-scoped-policy-20260928
           skopeo copy --all "docker://$IMAGE@$digest" "docker://$IMAGE:$TEST_TAG"
           test "$(skopeo inspect --format '{{.Digest}}' "docker://$IMAGE:$TEST_TAG")" = "$digest"
           jq -n --arg image "$IMAGE@$digest" --arg base "$BASE_IMAGE" \
             --arg revision "$GITHUB_SHA" --arg version "$VERSION" --arg tag "$build_tag" \
             --arg input_sha256 "$INPUT_SHA256" '{image:$image, base:$base, revision:$revision,
               version:$version, build_tag:$tag, input_sha256:$input_sha256,
-              package_source:"543a4f12bd834897a9ec577c7a485080b19ca1df",
-              kernel_rebuilt:false, activation:"disabled"}' > "$RUNNER_TEMP/evidence/build.json"
+              package_source:"fe40096cb558bce99978223974357486500e5931",
+              kernel_rebuilt:false, kernel_replaced:true, initramfs_regenerated:true,
+              kernel_archive_sha256:"0814bed69d64a188db231e3c927156ad40d5d02a1db98e7cd900cc5943c48148",
+              activation:"disabled"}' > "$RUNNER_TEMP/evidence/build.json"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           printf 'Signed test image: `%s@%s`\n\nNo installation or charging activation performed.\n' "$IMAGE" "$digest" >> "$GITHUB_STEP_SUMMARY"
       - name: Upload build evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: kpfe-desktop-policy-image-${{ github.run_id }}-${{ github.run_attempt }}
+          name: kpfe-scoped-policy-image-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/evidence/
           if-no-files-found: warn
           retention-days: 30

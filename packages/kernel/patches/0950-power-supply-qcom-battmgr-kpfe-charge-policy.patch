@@ -1,19 +1,21 @@
 From: mrdidit <26687854+mrdidit@users.noreply.github.com>
-Subject: [PATCH] power: supply: qcom_battmgr: scope KPFE charge policy to Armada
+Subject: [PATCH] power: supply: qcom_battmgr: isolate KPFE charge policy behind device match
 
 Extract the battery property-29 command, precise device scoping and
 fail-safe attach/restart re-arm lifecycle from the ROCKNIX
 0518/0520/0522 changes. Keep USB supplies read-only; no PPS, input-
 current or external-pump controls.
 
-Use immutable exact-root and PMIC-GLINK match data. Correlate the
+Select KPFE-only request, reply, threshold and lifecycle paths through
+immutable exact-root and PMIC-GLINK match data. Preserve the existing
+paths on every unmatched device. On KPFE, correlate the
 available opcode/property fields, reject malformed replies and
 preserve transport errors. The firmware's property-29 SET ACK does not
 define value or result; untagged same-property late replies still
 require a bounded quiet drain. Keep requested charge_behaviour
 separate from observed telemetry.
 
-Return threshold RPC errors and serialize their cache updates.
+Return KPFE threshold RPC errors and serialize their cache updates.
 Preserve Armada's existing charge-unit and charge-now changes.
 
 Derived from mrdidit/distribution
@@ -24,6 +26,7 @@ Armada 6027251e6c087d18433f0d1b0731b514ff217a25 (7.2.3). This is a
 review candidate, not evidence of Armada hardware validation.
 
 ---
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
 --- a/drivers/power/supply/qcom_battmgr.c
 +++ b/drivers/power/supply/qcom_battmgr.c
 @@ -9,6 +9,8 @@
@@ -35,20 +38,20 @@ review candidate, not evidence of Armada hardware validation.
  #include <linux/power_supply.h>
  #include <linux/property.h>
  #include <linux/soc/qcom/pdr.h>
-@@ -24,6 +26,13 @@
- 	QCOM_BATTMGR_SM8350,
- 	QCOM_BATTMGR_SM8550,
+@@ -26,6 +28,13 @@
  	QCOM_BATTMGR_X1E80100,
-+};
-+
+ };
+ 
 +enum qcom_battmgr_kpfe_rearm_state {
 +	KPFE_REARM_IDLE,
 +	KPFE_REARM_PREPARE,
 +	KPFE_REARM_DISABLE_ONLY,
 +	KPFE_REARM_RECONCILE,
- };
- 
++};
++
  #define BATTMGR_BAT_STATUS		0x1
+ 
+ #define BATTMGR_REQUEST_NOTIFICATION	0x4
 @@ -74,6 +83,8 @@
  #define BATT_CHG_CTRL_START_THR		25
  #define BATT_CHG_CTRL_END_THR		26
@@ -58,20 +61,20 @@ review candidate, not evidence of Armada hardware validation.
  #define BATTMGR_USB_PROPERTY_GET	0x32
  #define BATTMGR_USB_PROPERTY_SET	0x33
  #define USB_ONLINE			0
-@@ -86,6 +97,13 @@
- #define USB_ADAP_TYPE			7
+@@ -87,6 +98,13 @@
  #define USB_MOISTURE_DET_EN		8
  #define USB_MOISTURE_DET_STS		9
-+
+ 
 +#define KPFE_BYPASS_REARM_DELAY_MS	2000
 +#define KPFE_BYPASS_RETRY_MS		250
 +#define KPFE_BYPASS_RETRY_TIMEOUT_MS	5000
 +#define KPFE_BYPASS_SLOW_RETRY_MS	5000
 +#define KPFE_BYPASS_ACK_DRAIN_MS	1000
 +#define KPFE_BYPASS_ACK_DRAIN_MAX	2
- 
++
  #define BATTMGR_WLS_PROPERTY_GET	0x34
  #define BATTMGR_WLS_PROPERTY_SET	0x35
+ #define WLS_ONLINE			0
 @@ -248,6 +266,7 @@
  	bool valid;
  
@@ -107,7 +110,7 @@ review candidate, not evidence of Armada hardware validation.
  
  	struct qcom_battmgr_info info;
  	struct qcom_battmgr_status status;
-@@ -332,32 +359,125 @@
+@@ -332,19 +359,135 @@
  	struct qcom_battmgr_wireless wireless;
  
  	struct work_struct enable_work;
@@ -119,10 +122,6 @@ review candidate, not evidence of Armada hardware validation.
  	 * firmware, as it then stops responding.
  	 */
  	struct mutex lock;
--};
--
--static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t len)
--{
 +
 +	enum power_supply_charge_behaviour kpfe_charge_behaviour;
 +	bool kpfe_ack_tainted;
@@ -140,16 +139,16 @@ review candidate, not evidence of Armada hardware validation.
 +	u32 kpfe_rearm_service_gen;
 +	u32 kpfe_ready_service_gen;
 +	atomic_t kpfe_service_gen;
-+};
-+
+ };
+ 
 +static int qcom_battmgr_request_once(struct qcom_battmgr *battmgr, void *data,
 +				     size_t len)
 +{
 +	const struct qcom_battmgr_property_request *request = data;
- 	unsigned long left;
++	unsigned long left;
 +	u32 service_gen = (u32)atomic_read(&battmgr->kpfe_service_gen);
- 	int ret;
- 
++	int ret;
++
 +	if (READ_ONCE(battmgr->shutting_down) || !READ_ONCE(battmgr->client))
 +		return -ESHUTDOWN;
 +	if (battmgr->device_data &&
@@ -158,9 +157,9 @@ review candidate, not evidence of Armada hardware validation.
 +	if (!READ_ONCE(battmgr->service_up))
 +		return -EAGAIN;
 +
- 	reinit_completion(&battmgr->ack);
- 
- 	battmgr->error = 0;
++	reinit_completion(&battmgr->ack);
++
++	battmgr->error = 0;
 +	if (battmgr->device_data) {
 +		battmgr->kpfe_expected_opcode = le32_to_cpu(request->hdr.opcode);
 +		battmgr->kpfe_expected_property = U32_MAX;
@@ -172,17 +171,12 @@ review candidate, not evidence of Armada hardware validation.
 +		/* Publish reply fields before the receive callback consumes them. */
 +		smp_store_release(&battmgr->kpfe_request_active, true);
 +	}
- 
- 	ret = pmic_glink_send(battmgr->client, data, len);
- 	if (ret < 0)
--		return ret;
++
++	ret = pmic_glink_send(battmgr->client, data, len);
++	if (ret < 0)
 +		goto out;
- 
- 	left = wait_for_completion_timeout(&battmgr->ack, HZ);
--	if (!left)
--		return -ETIMEDOUT;
--
--	return battmgr->error;
++
++	left = wait_for_completion_timeout(&battmgr->ack, HZ);
 +	ret = left ? battmgr->error : -ETIMEDOUT;
 +	if (!ret && battmgr->device_data &&
 +	    (!READ_ONCE(battmgr->service_up) ||
@@ -222,7 +216,7 @@ review candidate, not evidence of Armada hardware validation.
 +	return -EOVERFLOW;
 +}
 +
-+static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data,
++static int qcom_battmgr_kpfe_request(struct qcom_battmgr *battmgr, void *data,
 +				size_t len)
 +{
 +	int drain_ret;
@@ -239,10 +233,20 @@ review candidate, not evidence of Armada hardware validation.
 +	}
 +
 +	return ret;
- }
++}
++
+ static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t len)
+ {
+ 	unsigned long left;
+ 	int ret;
  
- static int qcom_battmgr_request_property(struct qcom_battmgr *battmgr, int opcode,
-@@ -375,6 +495,22 @@
++	if (battmgr->device_data)
++		return qcom_battmgr_kpfe_request(battmgr, data, len);
++
+ 	reinit_completion(&battmgr->ack);
+ 
+ 	battmgr->error = 0;
+@@ -375,6 +518,22 @@
  	return qcom_battmgr_request(battmgr, &request, sizeof(request));
  }
  
@@ -265,120 +269,132 @@ review candidate, not evidence of Armada hardware validation.
  static int qcom_battmgr_update_status(struct qcom_battmgr *battmgr)
  {
  	struct qcom_battmgr_update_request request = {
-@@ -430,6 +566,7 @@
- 	[POWER_SUPPLY_PROP_HEALTH] = BATT_HEALTH,
- 	[POWER_SUPPLY_PROP_PRESENT] = BATT_PRESENT,
- 	[POWER_SUPPLY_PROP_CHARGE_TYPE] = BATT_CHG_TYPE,
-+	[POWER_SUPPLY_PROP_ONLINE] = BATT_ONLINE,
- 	[POWER_SUPPLY_PROP_CAPACITY] = BATT_CAPACITY,
- 	[POWER_SUPPLY_PROP_VOLTAGE_OCV] = BATT_VOLT_OCV,
- 	[POWER_SUPPLY_PROP_VOLTAGE_NOW] = BATT_VOLT_NOW,
-@@ -520,6 +657,19 @@
- 	if (!battmgr->service_up)
- 		return -EAGAIN;
+@@ -509,6 +668,43 @@
+ 	return ret;
+ }
  
-+	if (!battmgr->device_data &&
-+	    (psp == POWER_SUPPLY_PROP_ONLINE ||
-+	     psp == POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR))
-+		return -EINVAL;
-+	if (battmgr->device_data &&
-+	    psp == POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR) {
++static int qcom_battmgr_kpfe_bat_get_property(struct power_supply *psy,
++					    enum power_supply_property psp,
++					    union power_supply_propval *val)
++{
++	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
++	int ret;
++
++	if (psp == POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR) {
 +		mutex_lock(&battmgr->lock);
 +		val->intval = battmgr->kpfe_charge_behaviour;
 +		mutex_unlock(&battmgr->lock);
-+
 +		return 0;
 +	}
 +
- 	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
- 	    battmgr->variant == QCOM_BATTMGR_X1E80100)
- 		ret = qcom_battmgr_bat_sc8280xp_update(battmgr, psp);
-@@ -528,9 +678,22 @@
- 	if (ret < 0)
- 		return ret;
- 
-+	if (psp == POWER_SUPPLY_PROP_STATUS &&
-+	    battmgr->device_data) {
-+		ret = qcom_battmgr_bat_sm8350_update(battmgr,
-+						     POWER_SUPPLY_PROP_ONLINE);
++	if (psp == POWER_SUPPLY_PROP_STATUS) {
++		ret = qcom_battmgr_bat_sm8350_update(battmgr, psp);
 +		if (ret < 0)
 +			return ret;
 +	}
 +
- 	switch (psp) {
- 	case POWER_SUPPLY_PROP_STATUS:
--		val->intval = battmgr->status.status;
-+		if (battmgr->device_data &&
-+		    !battmgr->info.online &&
-+		    battmgr->status.status == POWER_SUPPLY_STATUS_CHARGING)
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
++					   BATT_ONLINE, 0);
++	if (!ret) {
++		if (psp == POWER_SUPPLY_PROP_ONLINE)
++			val->intval = battmgr->info.online;
++		else if (!battmgr->info.online &&
++			 battmgr->status.status == POWER_SUPPLY_STATUS_CHARGING)
 +			val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
 +		else
 +			val->intval = battmgr->status.status;
- 		break;
- 	case POWER_SUPPLY_PROP_CHARGE_TYPE:
- 		val->intval = battmgr->info.charge_type;
-@@ -540,6 +703,9 @@
- 		break;
- 	case POWER_SUPPLY_PROP_PRESENT:
- 		val->intval = battmgr->info.present;
-+		break;
-+	case POWER_SUPPLY_PROP_ONLINE:
-+		val->intval = battmgr->info.online;
- 		break;
- 	case POWER_SUPPLY_PROP_TECHNOLOGY:
- 		val->intval = battmgr->info.technology;
-@@ -680,6 +846,7 @@
- 	int ret;
- 
- 	start_soc = clamp(start_soc, CHARGE_CTRL_START_THR_MIN, CHARGE_CTRL_START_THR_MAX);
-+	mutex_lock(&battmgr->lock);
- 
- 	/*
- 	 * If the new start threshold is larger than the old end threshold,
-@@ -696,15 +863,14 @@
- 		delta_soc = battmgr->info.charge_ctrl_end - start_soc;
- 	}
- 
--	mutex_lock(&battmgr->lock);
- 	ret = qcom_battmgr_set_charge_control(battmgr, target_soc, delta_soc);
--	mutex_unlock(&battmgr->lock);
- 	if (!ret) {
- 		battmgr->info.charge_ctrl_start = start_soc;
- 		battmgr->info.charge_ctrl_end = target_soc;
- 	}
--
--	return 0;
++	}
 +	mutex_unlock(&battmgr->lock);
 +
 +	return ret;
++}
++
+ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
+ 					 enum power_supply_property psp,
+ 					 union power_supply_propval *val)
+@@ -520,6 +716,12 @@
+ 	if (!battmgr->service_up)
+ 		return -EAGAIN;
+ 
++	if (battmgr->device_data &&
++	    (psp == POWER_SUPPLY_PROP_ONLINE ||
++	     psp == POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR ||
++	     psp == POWER_SUPPLY_PROP_STATUS))
++		return qcom_battmgr_kpfe_bat_get_property(psy, psp, val);
++
+ 	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
+ 	    battmgr->variant == QCOM_BATTMGR_X1E80100)
+ 		ret = qcom_battmgr_bat_sc8280xp_update(battmgr, psp);
+@@ -674,6 +876,39 @@
+ 	return qcom_battmgr_request(battmgr, &request, sizeof(request));
  }
  
++static int qcom_battmgr_kpfe_set_charge_start_threshold(struct qcom_battmgr *battmgr, int start_soc)
++{
++	u32 target_soc, delta_soc;
++	int ret;
++
++	start_soc = clamp(start_soc, CHARGE_CTRL_START_THR_MIN, CHARGE_CTRL_START_THR_MAX);
++	mutex_lock(&battmgr->lock);
++
++	/*
++	 * If the new start threshold is larger than the old end threshold,
++	 * move the end threshold one step (DELTA_SOC) after the new start
++	 * threshold.
++	 */
++	if (start_soc > battmgr->info.charge_ctrl_end) {
++		target_soc = start_soc + CHARGE_CTRL_DELTA_SOC;
++		target_soc = min_t(u32, target_soc, CHARGE_CTRL_END_THR_MAX);
++		delta_soc = target_soc - start_soc;
++		delta_soc = min_t(u32, delta_soc, CHARGE_CTRL_DELTA_SOC);
++	} else {
++		target_soc =  battmgr->info.charge_ctrl_end;
++		delta_soc = battmgr->info.charge_ctrl_end - start_soc;
++	}
++
++	ret = qcom_battmgr_set_charge_control(battmgr, target_soc, delta_soc);
++	if (!ret) {
++		battmgr->info.charge_ctrl_start = start_soc;
++		battmgr->info.charge_ctrl_end = target_soc;
++	}
++	mutex_unlock(&battmgr->lock);
++
++	return ret;
++}
++
+ static int qcom_battmgr_set_charge_start_threshold(struct qcom_battmgr *battmgr, int start_soc)
+ {
+ 	u32 target_soc, delta_soc;
+@@ -707,6 +942,27 @@
+ 	return 0;
+ }
+ 
++static int qcom_battmgr_kpfe_set_charge_end_threshold(struct qcom_battmgr *battmgr, int end_soc)
++{
++	u32 delta_soc = CHARGE_CTRL_DELTA_SOC;
++	int ret;
++
++	end_soc = clamp(end_soc, CHARGE_CTRL_END_THR_MIN, CHARGE_CTRL_END_THR_MAX);
++	mutex_lock(&battmgr->lock);
++
++	if (battmgr->info.charge_ctrl_start && end_soc > battmgr->info.charge_ctrl_start)
++		delta_soc = end_soc - battmgr->info.charge_ctrl_start;
++
++	ret = qcom_battmgr_set_charge_control(battmgr, end_soc, delta_soc);
++	if (!ret) {
++		battmgr->info.charge_ctrl_start = end_soc - delta_soc;
++		battmgr->info.charge_ctrl_end = end_soc;
++	}
++	mutex_unlock(&battmgr->lock);
++
++	return ret;
++}
++
  static int qcom_battmgr_set_charge_end_threshold(struct qcom_battmgr *battmgr, int end_soc)
-@@ -713,19 +879,19 @@
- 	int ret;
- 
- 	end_soc = clamp(end_soc, CHARGE_CTRL_END_THR_MIN, CHARGE_CTRL_END_THR_MAX);
-+	mutex_lock(&battmgr->lock);
- 
- 	if (battmgr->info.charge_ctrl_start && end_soc > battmgr->info.charge_ctrl_start)
- 		delta_soc = end_soc - battmgr->info.charge_ctrl_start;
- 
--	mutex_lock(&battmgr->lock);
- 	ret = qcom_battmgr_set_charge_control(battmgr, end_soc, delta_soc);
--	mutex_unlock(&battmgr->lock);
- 	if (!ret) {
- 		battmgr->info.charge_ctrl_start = end_soc - delta_soc;
- 		battmgr->info.charge_ctrl_end = end_soc;
- 	}
--
--	return 0;
-+	mutex_unlock(&battmgr->lock);
-+
-+	return ret;
- }
- 
- static int qcom_battmgr_charge_control_thresholds_init(struct qcom_battmgr *battmgr)
-@@ -760,7 +926,11 @@
+ {
+ 	u32 delta_soc = CHARGE_CTRL_DELTA_SOC;
+@@ -760,7 +1016,11 @@
  static int qcom_battmgr_bat_is_writeable(struct power_supply *psy,
  					 enum power_supply_property psp)
  {
@@ -390,7 +406,7 @@ review candidate, not evidence of Armada hardware validation.
  	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
  	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
  		return 1;
-@@ -771,16 +941,184 @@
+@@ -771,12 +1031,204 @@
  	return 0;
  }
  
@@ -507,21 +523,21 @@ review candidate, not evidence of Armada hardware validation.
 +static bool qcom_battmgr_kpfe_service_ready(struct qcom_battmgr *battmgr,
 +					    u32 service_gen);
 +
- static int qcom_battmgr_bat_set_property(struct power_supply *psy,
- 					 enum power_supply_property psp,
- 					 const union power_supply_propval *pval)
- {
- 	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
++static int qcom_battmgr_kpfe_bat_set_property(struct power_supply *psy,
++					 enum power_supply_property psp,
++					 const union power_supply_propval *pval)
++{
++	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
 +	enum power_supply_charge_behaviour behaviour;
 +	bool allow_charging;
 +	bool preserve_rearm;
 +	u32 service_gen;
 +	int ret;
- 
- 	if (!battmgr->service_up)
- 		return -EAGAIN;
- 
- 	switch (psp) {
++
++	if (!battmgr->service_up)
++		return -EAGAIN;
++
++	switch (psp) {
 +	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
 +		if (!battmgr->device_data)
 +			return -EINVAL;
@@ -572,10 +588,30 @@ review candidate, not evidence of Armada hardware validation.
 +			power_supply_changed(psy);
 +
 +		return ret;
- 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
- 		return qcom_battmgr_set_charge_start_threshold(battmgr, pval->intval);
- 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
-@@ -933,6 +1271,46 @@
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
++		return qcom_battmgr_kpfe_set_charge_start_threshold(battmgr, pval->intval);
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
++		return qcom_battmgr_kpfe_set_charge_end_threshold(battmgr, pval->intval);
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ static int qcom_battmgr_bat_set_property(struct power_supply *psy,
+ 					 enum power_supply_property psp,
+ 					 const union power_supply_propval *pval)
+ {
+ 	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
+ 
++	if (battmgr->device_data)
++		return qcom_battmgr_kpfe_bat_set_property(psy, psp, pval);
++
+ 	if (!battmgr->service_up)
+ 		return -EAGAIN;
+ 
+@@ -933,6 +1385,46 @@
  	.property_is_writeable = qcom_battmgr_bat_is_writeable,
  };
  
@@ -622,63 +658,58 @@ review candidate, not evidence of Armada hardware validation.
  static int qcom_battmgr_ac_get_property(struct power_supply *psy,
  					enum power_supply_property psp,
  					union power_supply_propval *val)
-@@ -1214,6 +1592,8 @@
+@@ -1214,6 +1706,8 @@
  		power_supply_changed(battmgr->bat_psy);
  		break;
  	case NOTIF_USB_PROPERTY:
 +		if (battmgr->device_data)
-+			schedule_work(&battmgr->kpfe_charge_work);
++			queue_work(system_percpu_wq, &battmgr->kpfe_charge_work);
  		power_supply_changed(battmgr->usb_psy);
  		break;
  	case NOTIF_WLS_PROPERTY:
-@@ -1382,6 +1762,30 @@
- 	}
+@@ -1574,11 +2068,113 @@
+ 	complete(&battmgr->ack);
+ }
  
- 	switch (opcode) {
-+	case BATTMGR_BAT_PROPERTY_SET:
-+		if (payload_len != sizeof(resp->intval)) {
-+			dev_warn(battmgr->dev,
-+				 "invalid payload length for battery property set: %zd\n",
-+				 payload_len);
-+			battmgr->error = -ENODATA;
-+			break;
-+		}
++static bool qcom_battmgr_kpfe_property_response(struct qcom_battmgr *battmgr,
++					      const struct qcom_battmgr_message *resp,
++					      size_t len)
++{
++	unsigned int opcode = le32_to_cpu(resp->hdr.opcode);
++	size_t payload_len = len - sizeof(resp->hdr);
 +
-+		property = le32_to_cpu(resp->intval.property);
-+		if (!battmgr->device_data || property != BATT_ONLINE) {
-+			dev_warn(battmgr->dev,
-+				 "unexpected battery property set response: %#x\n",
-+				 property);
++	if (opcode == BATTMGR_BAT_PROPERTY_SET) {
++		if (payload_len != sizeof(resp->intval) ||
++		    le32_to_cpu(resp->intval.property) != BATT_ONLINE)
 +			battmgr->error = -ENODATA;
-+			break;
-+		}
-+
-+		/*
-+		 * KPFE firmware leaves value and result undefined in the SET
-+		 * acknowledgment. A matching property is the acknowledgment.
-+		 */
-+		battmgr->error = 0;
-+		break;
- 	case BATTMGR_BAT_PROPERTY_GET:
- 		property = le32_to_cpu(resp->intval.property);
- 		if (property == BATT_MODEL_NAME) {
-@@ -1416,6 +1820,9 @@
- 		case BATT_PRESENT:
- 			battmgr->info.present = le32_to_cpu(resp->intval.value);
- 			break;
-+		case BATT_ONLINE:
++		else
++			/* KPFE SET acknowledgements leave value and result undefined. */
++			battmgr->error = 0;
++	} else if (opcode == BATTMGR_BAT_PROPERTY_GET) {
++		if (payload_len < sizeof(__le32) ||
++		    le32_to_cpu(resp->intval.property) != BATT_ONLINE)
++			return false;
++		if (payload_len != sizeof(resp->intval))
++			battmgr->error = -ENODATA;
++		else if (le32_to_cpu(resp->intval.result))
++			battmgr->error = -EIO;
++		else {
 +			battmgr->info.online = le32_to_cpu(resp->intval.value);
-+			break;
- 		case BATT_CHG_TYPE:
- 			battmgr->info.charge_type = le32_to_cpu(resp->intval.value);
- 			break;
-@@ -1577,8 +1984,48 @@
- static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
- {
- 	const struct pmic_glink_hdr *hdr = data;
++			battmgr->error = 0;
++		}
++	} else {
++		return false;
++	}
++
++	complete(&battmgr->ack);
++	return true;
++}
++
++static void qcom_battmgr_kpfe_callback(const void *data, size_t len, void *priv)
++{
++	const struct pmic_glink_hdr *hdr = data;
 +	const struct qcom_battmgr_message *resp = data;
- 	struct qcom_battmgr *battmgr = priv;
--	unsigned int opcode = le32_to_cpu(hdr->opcode);
++	struct qcom_battmgr *battmgr = priv;
 +	unsigned int opcode;
 +	u32 property;
 +	size_t payload_len;
@@ -719,13 +750,16 @@ review candidate, not evidence of Armada hardware validation.
 +			}
 +		}
 +	}
- 
- 	if (opcode == BATTMGR_NOTIFICATION)
- 		qcom_battmgr_notification(battmgr, data, len);
-@@ -1587,6 +2034,493 @@
- 		qcom_battmgr_sc8280xp_callback(battmgr, data, len);
- 	else
- 		qcom_battmgr_sm8350_callback(battmgr, data, len);
++
++	if (opcode == BATTMGR_NOTIFICATION)
++		qcom_battmgr_notification(battmgr, data, len);
++	else if (qcom_battmgr_kpfe_property_response(battmgr, resp, len))
++		return;
++	else if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
++		 battmgr->variant == QCOM_BATTMGR_X1E80100)
++		qcom_battmgr_sc8280xp_callback(battmgr, data, len);
++	else
++		qcom_battmgr_sm8350_callback(battmgr, data, len);
 +	return;
 +
 +invalid_response:
@@ -733,6 +767,25 @@ review candidate, not evidence of Armada hardware validation.
 +	complete(&battmgr->ack);
 +}
 +
+ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
+ {
+ 	const struct pmic_glink_hdr *hdr = data;
+ 	struct qcom_battmgr *battmgr = priv;
+-	unsigned int opcode = le32_to_cpu(hdr->opcode);
++	unsigned int opcode;
++
++	if (battmgr->device_data) {
++		qcom_battmgr_kpfe_callback(data, len, priv);
++		return;
++	}
++	opcode = le32_to_cpu(hdr->opcode);
+ 
+ 	if (opcode == BATTMGR_NOTIFICATION)
+ 		qcom_battmgr_notification(battmgr, data, len);
+@@ -1589,6 +2185,581 @@
+ 		qcom_battmgr_sm8350_callback(battmgr, data, len);
+ }
+ 
 +static bool qcom_battmgr_kpfe_service_current(struct qcom_battmgr *battmgr,
 +					      u32 service_gen)
 +{
@@ -763,7 +816,7 @@ review candidate, not evidence of Armada hardware validation.
 +					     battmgr->kpfe_rearm_service_gen))
 +		return;
 +
-+	mod_delayed_work(system_wq, &battmgr->kpfe_charge_rearm_work, delay);
++	mod_delayed_work(system_percpu_wq, &battmgr->kpfe_charge_rearm_work, delay);
 +}
 +
 +static void qcom_battmgr_kpfe_start_rearm_locked(struct qcom_battmgr *battmgr,
@@ -1213,15 +1266,16 @@ review candidate, not evidence of Armada hardware validation.
 +
 +	if (stale)
 +		dev_dbg(battmgr->dev, "discarded stale KPFE charge re-arm work\n");
- }
- 
- static void qcom_battmgr_enable_worker(struct work_struct *work)
-@@ -1597,24 +2531,134 @@
- 		.hdr.type = cpu_to_le32(PMIC_GLINK_NOTIFY),
- 		.hdr.opcode = cpu_to_le32(BATTMGR_REQUEST_NOTIFICATION),
- 	};
--	int ret;
--
++}
++
++static void qcom_battmgr_kpfe_enable_worker(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr, enable_work);
++	struct qcom_battmgr_enable_request req = {
++		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
++		.hdr.type = cpu_to_le32(PMIC_GLINK_NOTIFY),
++		.hdr.opcode = cpu_to_le32(BATTMGR_REQUEST_NOTIFICATION),
++	};
 +	bool queue_kpfe = false;
 +	bool stale = false;
 +	bool taint_recovery_failed = false;
@@ -1276,8 +1330,7 @@ review candidate, not evidence of Armada hardware validation.
 +			goto out_unlock;
 +		}
 +	}
- 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
--	if (ret)
++	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
 +	if (!ret && battmgr->device_data) {
 +		if (!qcom_battmgr_kpfe_service_current(battmgr, service_gen)) {
 +			stale = true;
@@ -1302,28 +1355,41 @@ review candidate, not evidence of Armada hardware validation.
 +		dev_err(battmgr->dev,
 +			"failed to recover tainted KPFE charge transport: %d\n", ret);
 +	else if (ret && !stale)
- 		dev_err(battmgr->dev, "failed to request power notifications\n");
++		dev_err(battmgr->dev, "failed to request power notifications\n");
 +	else if (queue_kpfe &&
 +		 qcom_battmgr_kpfe_service_ready(battmgr, service_gen))
-+		schedule_work(&battmgr->kpfe_charge_work);
++		queue_work(system_percpu_wq, &battmgr->kpfe_charge_work);
++}
++
+ static void qcom_battmgr_enable_worker(struct work_struct *work)
+ {
+ 	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr, enable_work);
+@@ -1599,15 +2770,46 @@
+ 	};
+ 	int ret;
+ 
++	if (battmgr->device_data) {
++		qcom_battmgr_kpfe_enable_worker(work);
++		return;
++	}
++
+ 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
+ 	if (ret)
+ 		dev_err(battmgr->dev, "failed to request power notifications\n");
  }
  
- static void qcom_battmgr_pdr_notify(void *priv, int state)
- {
- 	struct qcom_battmgr *battmgr = priv;
- 
++static void qcom_battmgr_kpfe_pdr_notify(void *priv, int state)
++{
++	struct qcom_battmgr *battmgr = priv;
++
 +	if (READ_ONCE(battmgr->shutting_down))
 +		return;
 +
- 	if (state == SERVREG_SERVICE_STATE_UP) {
--		battmgr->service_up = true;
++	if (state == SERVREG_SERVICE_STATE_UP) {
 +		atomic_inc(&battmgr->kpfe_service_gen);
 +		WRITE_ONCE(battmgr->service_up, true);
- 		schedule_work(&battmgr->enable_work);
- 	} else {
--		battmgr->service_up = false;
--	}
--}
++		queue_work(system_percpu_wq, &battmgr->enable_work);
++	} else {
 +		WRITE_ONCE(battmgr->service_up, false);
 +		atomic_inc(&battmgr->kpfe_service_gen);
 +		if (battmgr->device_data) {
@@ -1333,7 +1399,23 @@ review candidate, not evidence of Armada hardware validation.
 +	}
 +}
 +
-+static void qcom_battmgr_cancel_work(void *data)
+ static void qcom_battmgr_pdr_notify(void *priv, int state)
+ {
+ 	struct qcom_battmgr *battmgr = priv;
+ 
++	if (battmgr->device_data) {
++		qcom_battmgr_kpfe_pdr_notify(priv, state);
++		return;
++	}
++
+ 	if (state == SERVREG_SERVICE_STATE_UP) {
+ 		battmgr->service_up = true;
+ 		schedule_work(&battmgr->enable_work);
+@@ -1616,6 +2818,29 @@
+ 	}
+ }
+ 
++static void qcom_battmgr_kpfe_cancel_work(void *data)
 +{
 +	struct qcom_battmgr *battmgr = data;
 +
@@ -1355,33 +1437,28 @@ review candidate, not evidence of Armada hardware validation.
 +	.glink_compatible = "qcom,sm8750-pmic-glink",
 +	.battery_desc = &kpfe_bat_psy_desc,
 +};
- 
++
  static const struct of_device_id qcom_battmgr_of_variants[] = {
  	{ .compatible = "qcom,glymur-pmic-glink", .data = (void *)QCOM_BATTMGR_X1E80100 },
-@@ -1645,6 +2689,10 @@
- 		return -ENOMEM;
- 
- 	battmgr->dev = dev;
-+	INIT_WORK(&battmgr->kpfe_charge_work, qcom_battmgr_kpfe_charge_worker);
-+	INIT_DELAYED_WORK(&battmgr->kpfe_charge_rearm_work,
-+			  qcom_battmgr_kpfe_charge_rearm_worker);
-+	atomic_set(&battmgr->kpfe_service_gen, 0);
- 
- 	psy_cfg.drv_data = battmgr;
- 	psy_cfg.fwnode = dev_fwnode(&adev->dev);
-@@ -1663,6 +2711,11 @@
- 		battmgr->variant = (unsigned long)match->data;
+ 	{ .compatible = "qcom,kaanapali-pmic-glink", .data = (void *)QCOM_BATTMGR_SM8550 },
+@@ -1664,6 +2889,16 @@
  	else
  		battmgr->variant = QCOM_BATTMGR_SM8350;
-+
+ 
 +	if (of_machine_is_compatible(kpfe_device_data.root_compatible) &&
 +	    of_device_is_compatible(dev->parent->of_node,
-+				    kpfe_device_data.glink_compatible))
++				    kpfe_device_data.glink_compatible)) {
 +		battmgr->device_data = &kpfe_device_data;
- 
++		INIT_WORK(&battmgr->kpfe_charge_work, qcom_battmgr_kpfe_charge_worker);
++		INIT_DELAYED_WORK(&battmgr->kpfe_charge_rearm_work,
++				  qcom_battmgr_kpfe_charge_rearm_worker);
++		atomic_set(&battmgr->kpfe_service_gen, 0);
++	}
++
  	ret = qcom_battmgr_charge_control_thresholds_init(battmgr);
  	if (ret < 0)
-@@ -1704,7 +2757,9 @@
+ 		return dev_err_probe(dev, ret,
+@@ -1704,7 +2939,9 @@
  		 */
  		battmgr->unit = QCOM_BATTMGR_UNIT_mAh;
  
@@ -1392,13 +1469,15 @@ review candidate, not evidence of Armada hardware validation.
  			psy_desc = &sm8550_bat_psy_desc;
  		else
  			psy_desc = &sm8350_bat_psy_desc;
-@@ -1732,6 +2787,10 @@
+@@ -1732,6 +2969,12 @@
  	if (IS_ERR(battmgr->client))
  		return PTR_ERR(battmgr->client);
  
-+	ret = devm_add_action_or_reset(dev, qcom_battmgr_cancel_work, battmgr);
-+	if (ret)
-+		return ret;
++	if (battmgr->device_data) {
++		ret = devm_add_action_or_reset(dev, qcom_battmgr_kpfe_cancel_work, battmgr);
++		if (ret)
++			return ret;
++	}
 +
  	pmic_glink_client_register(battmgr->client);
  

@@ -16,7 +16,7 @@ import tempfile
 RELEASE = "7.2.3"
 PREFIX = f"lib/modules/{RELEASE}/"
 PATCH = "0950-power-supply-qcom-battmgr-kpfe-charge-policy.patch"
-PATCH_SHA256 = "3477fd5cb54a81bb89fedd6bb0b0354d6dca55abfc8ef0d9d587b15c84086fad"
+PATCH_SHA256 = "d6e3fd90a18270675bf03e96880d8be6ba72e2981742bbad3bd433dcbe35fa36"
 MODULE = "kernel/drivers/power/supply/qcom_battmgr.ko"
 METADATA = (".armada-source", "modules.order", "modules.builtin", "modules.dep", "modules.alias")
 WORKERS = ("qcom_battmgr_kpfe_charge_worker", "qcom_battmgr_kpfe_charge_rearm_worker")

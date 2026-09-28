@@ -410,7 +410,7 @@ class ImageChecks(unittest.TestCase):
             report = json.loads(evidence.read_text())
             self.assertFalse(report["charging_enabled"])
             self.assertFalse(report["kernel_rebuilt"])
-            self.assertEqual(report["package_build_id"], "35854292032")
+            self.assertEqual(report["package_build_id"], "36397464944")
             self.assertEqual(report["enablement_receipt"], "not-generated")
 
     def test_failed_test_transaction_never_installs_or_emits_evidence(self):

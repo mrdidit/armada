@@ -1,0 +1,11 @@
+c1e30a3384dbe54a90df93ba2f5bef14c0ff496332157e1b699ad9e539bd0ad3  rpms/armada-charging-0.1.0-1.fc44.armada.charging.b36397464944.noarch.rpm
+f487f4ff87ad240c7fd1a53e85c9232da5140c1aff65b85f66030612fb796c9a  rpms/powerdevil-6.7.4-2.fc44.armada.charging.b36397464944.aarch64.rpm
+b158ae758a97c2769247bed7ebbacafa2c2aa8b1280c3e77d114285b60b3d02c  rpms/upower-1.91.4-1.fc44.armada.charging.b36397464944.aarch64.rpm
+5d5afdebbc87171e139a9317d67163653a854d7d05ca83285e8240aef7da3128  rpms/upower-libs-1.91.4-1.fc44.armada.charging.b36397464944.aarch64.rpm
+8601a755824fc270f058a0563bbb3e8d4468ed260a6301f626cfbbdee1dc58eb  srpms/armada-charging-0.1.0-1.fc44.armada.charging.b36397464944.src.rpm
+0a5cc3198560051222e5e9ee43d66afba966d714842f12763a2ad3288f8aff89  srpms/powerdevil-6.7.4-2.fc44.armada.charging.b36397464944.src.rpm
+307d104812b2f139f6b70e99ca4162d480eee55f8549f4b78909abc5d55e7b6a  srpms/upower-1.91.4-1.fc44.armada.charging.b36397464944.src.rpm
+0814bed69d64a188db231e3c927156ad40d5d02a1db98e7cd900cc5943c48148  kernel/armada-kernel-7.2.3.tar.zst
+6e6f087f4ea7edd63ea1759d8817f7d312dee28e10323ea96e00079514f0c490  kernel/armada-kernel-7.2.3.tar.zst.sha256
+2773d79b6e54aced4ecb7ac6f1923ae6bc00015c75567d46cb90b7eae25aea72  kernel-sources/armada-kernel-inputs.tar.gz
+8ba259e8e7b13ec6ef0941c8a39ad90b24bd4a4d6c0010ba6bafb794550ecd03  kernel-sources/linux-7.2.3.tar.xz

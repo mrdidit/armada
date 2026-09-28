@@ -17,31 +17,31 @@ import sys
 
 
 BASE_IMAGE = "ghcr.io/mrdidit/armada@sha256:3ad2d5de4575d8fffacc92a77aae6a382f9a0066818f5f99e8de3d35cb26313c"
-SOURCE_REVISION = "543a4f12bd834897a9ec577c7a485080b19ca1df"
-BUILD_ID = "35854292032"
+SOURCE_REVISION = "fe40096cb558bce99978223974357486500e5931"
+BUILD_ID = "36397464944"
 RPM_DIRECTORY = Path("/charging-rpms")
 EVIDENCE_PATH = Path("/usr/share/armada-charging/image-verification.json")
 QUERY_FORMAT = "%{NAME}\t%{EPOCHNUM}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n"
 PACKAGES = {
     "powerdevil": (
-        "powerdevil-6.7.4-2.fc44.armada.charging.b35854292032.aarch64.rpm",
-        "46dd088fabce1ef3297fcc2cec06741c3c44b4f76685c29549295cc6c4b991e8",
-        ("powerdevil", "0", "6.7.4", "2.fc44.armada.charging.b35854292032", "aarch64"),
+        "powerdevil-6.7.4-2.fc44.armada.charging.b36397464944.aarch64.rpm",
+        "f487f4ff87ad240c7fd1a53e85c9232da5140c1aff65b85f66030612fb796c9a",
+        ("powerdevil", "0", "6.7.4", "2.fc44.armada.charging.b36397464944", "aarch64"),
     ),
     "upower": (
-        "upower-1.91.4-1.fc44.armada.charging.b35854292032.aarch64.rpm",
-        "eb67753a1ee8e9c39c340cc584b02d1b459c1c4c2e53f415e790b03112546edf",
-        ("upower", "0", "1.91.4", "1.fc44.armada.charging.b35854292032", "aarch64"),
+        "upower-1.91.4-1.fc44.armada.charging.b36397464944.aarch64.rpm",
+        "b158ae758a97c2769247bed7ebbacafa2c2aa8b1280c3e77d114285b60b3d02c",
+        ("upower", "0", "1.91.4", "1.fc44.armada.charging.b36397464944", "aarch64"),
     ),
     "upower-libs": (
-        "upower-libs-1.91.4-1.fc44.armada.charging.b35854292032.aarch64.rpm",
-        "a53735d1645c62cc1f3ad17004ed4f5249b04e9b375d0785bcec7c897201d6f3",
-        ("upower-libs", "0", "1.91.4", "1.fc44.armada.charging.b35854292032", "aarch64"),
+        "upower-libs-1.91.4-1.fc44.armada.charging.b36397464944.aarch64.rpm",
+        "5d5afdebbc87171e139a9317d67163653a854d7d05ca83285e8240aef7da3128",
+        ("upower-libs", "0", "1.91.4", "1.fc44.armada.charging.b36397464944", "aarch64"),
     ),
     "armada-charging": (
-        "armada-charging-0.1.0-1.fc44.armada.charging.b35854292032.noarch.rpm",
-        "da069a3acc0ad91bd2941522c0c829bdab92fbe963f27f681e186efb8427633a",
-        ("armada-charging", "0", "0.1.0", "1.fc44.armada.charging.b35854292032", "noarch"),
+        "armada-charging-0.1.0-1.fc44.armada.charging.b36397464944.noarch.rpm",
+        "c1e30a3384dbe54a90df93ba2f5bef14c0ff496332157e1b699ad9e539bd0ad3",
+        ("armada-charging", "0", "0.1.0", "1.fc44.armada.charging.b36397464944", "noarch"),
     ),
 }
 BASE_PACKAGES = {
@@ -435,6 +435,7 @@ def install():
     preserved = verify_rpm_files(run(["rpm", "-V", *PACKAGES], check=False), before, after)
     evidence = {
         "schema_version": 1, "base_image": BASE_IMAGE, "package_build_id": BUILD_ID,
+        "scope": "RPM transaction before the separate kernel replacement",
         "package_source_revision": SOURCE_REVISION, "result": "disabled-image-transaction-verified",
         "rpms": {item[0]: item[1] for item in PACKAGES.values()},
         "packages_before": sorted(list(item) for item in before_packages.elements()),
