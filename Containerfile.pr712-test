@@ -1,0 +1,45 @@
+# Replace only the kernel and its initramfs in the pinned upstream test image.
+# Package builds and image metadata are supplied by pr712-test.yml.
+ARG BASE_IMAGE=ghcr.io/armada-os/armada@sha256:7c2270888658e06e7419a4365b4224a46d81aec52c74c5d1f50b9cda7c066568
+ARG CHUNKAH_IMAGE=quay.io/coreos/chunkah@sha256:ff8b8b466a942ec6000445d4001fc661e2fc5a952ad9ee29b4de9ab09d1d1708
+ARG KERNEL_REF
+
+FROM ${KERNEL_REF} AS kernel
+
+FROM scratch AS ctx
+COPY build_files/20-install-kernel.sh build_files/52-configure-os-release.sh build_files/55-generate-initramfs.sh build_files/pr712-test.env build_files/pr712-test-overlay.sh /build_files/
+COPY system_files/usr/lib/firmware/ /system_files/usr/lib/firmware/
+
+FROM ${BASE_IMAGE} AS armada-rootfs
+ARG BASE_IMAGE
+ARG KERNEL_REF
+ARG ARMADA_VERSION
+LABEL org.opencontainers.image.version="${ARMADA_VERSION}"
+
+RUN --network=none \
+    --mount=type=bind,from=ctx,source=/,target=/ctx \
+    --mount=type=bind,from=kernel,source=/kernel,target=/packages/kernel \
+    --mount=type=cache,dst=/var/cache \
+    --mount=type=cache,dst=/var/log \
+    --mount=type=tmpfs,dst=/tmp \
+    /bin/bash /ctx/build_files/pr712-test-overlay.sh
+
+RUN --network=none bootc container lint
+
+# Keep the upstream chunk layout and runtime config for bootc distribution.
+FROM ${CHUNKAH_IMAGE} AS chunkah
+ARG CHUNKAH_CONFIG_STR
+RUN --mount=from=armada-rootfs,target=/chunkah,ro \
+    /bin/bash -o pipefail -c ' \
+        set -e; \
+        start=${SECONDS}; \
+        chunkah build --verbose --compressed --compression-level 6 \
+            --arch arm64 --max-layers 128 --source-date-epoch 0 \
+            --prune /sysroot/ \
+            --label ostree.commit- --label ostree.final-diffid- \
+            --config-str "${CHUNKAH_CONFIG_STR}" \
+            --output oci:/run/src/chunked 2>&1 | tee /run/src/chunkah.log; \
+        echo "Chunkah completed in $((SECONDS - start)) seconds" \
+    '
+
+FROM armada-rootfs AS armada

@@ -1,0 +1,335 @@
+---
+name: Build PR 712 KONKR suspend test
+
+on:
+  push:
+    branches:
+      - test-pr712-konkr-suspend-20261013
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: pr712-konkr-suspend-test
+  cancel-in-progress: false
+
+env:
+  TEST_IMAGE: ghcr.io/mrdidit/armada
+  TEST_TAG: test-pr712-konkr-suspend-20261013
+
+jobs:
+  image:
+    if: github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-pr712-konkr-suspend-20261013'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+      version: ${{ steps.prepare.outputs.version }}
+    steps:
+      - name: Require the existing fork signing key
+        env:
+          SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SIGNING_SECRET" ]; then
+            echo '::error::SIGNING_SECRET is missing; refusing to build an unsigned test image.'
+            exit 1
+          fi
+
+      - name: Check out the exact build commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify the fork signing identity before compiling
+        env:
+          SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$SIGNING_SECRET" | openssl pkey -pubout -outform DER > "$RUNNER_TEMP/signing-public.der"
+          openssl pkey -pubin -in build_files/pr712-test-signing.pub -outform DER > "$RUNNER_TEMP/expected-public.der"
+          cmp "$RUNNER_TEMP/signing-public.der" "$RUNNER_TEMP/expected-public.der"
+
+      - name: Free build space
+        uses: ublue-os/remove-unwanted-software@cc0becac701cf642c8f0a6613bbdaf5dc36b259e # v9
+        with:
+          remove-codeql: true
+
+      - name: Install container tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends buildah skopeo jq runc zstd binutils openssl
+          mkdir -p "$HOME/.config/containers"
+          printf '[engine]\nruntime = "runc"\n' > "$HOME/.config/containers/containers.conf"
+          buildah info --storage-opt=overlay.mount_program= |
+            jq -e '.store.GraphStatus["Native Overlay Diff"] == "true"'
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.6.3
+
+      - name: Verify the pinned testing base and prepare metadata
+        id: prepare
+        run: |
+          set -euo pipefail
+          source build_files/pr712-test.env
+          mkdir -p "$RUNNER_TEMP/evidence"
+          cosign verify --key system_files/etc/pki/containers/armada.pub \
+            "$PR712_BASE_IMAGE" > "$RUNNER_TEMP/evidence/base-signature.json"
+          skopeo inspect --override-arch arm64 --config "docker://$PR712_BASE_IMAGE" \
+            > "$RUNNER_TEMP/evidence/base-config.json"
+          jq -e --arg version "$PR712_BASE_VERSION" --arg revision "$PR712_BASE_REVISION" '
+            .architecture == "arm64" and .os == "linux" and
+            .config.Cmd == ["/sbin/init"] and
+            .config.Labels["org.opencontainers.image.version"] == $version and
+            .config.Labels["org.opencontainers.image.revision"] == $revision' \
+            "$RUNNER_TEMP/evidence/base-config.json"
+          version="20261013.pr712.${GITHUB_SHA:0:7}"
+          jq --arg version "$version" --arg revision "$GITHUB_SHA" --arg base "$PR712_BASE_IMAGE" \
+            --arg pr "$PR712_COMMIT" '
+            .config |
+            .Labels["org.opencontainers.image.version"] = $version |
+            .Labels["org.opencontainers.image.revision"] = $revision |
+            .Labels["org.opencontainers.image.created"] = (now | todateiso8601) |
+            .Labels["org.opencontainers.image.description"] = "Armada testing with PR 712 KONKR MCU suspend power-off" |
+            .Labels["org.opencontainers.image.source"] = ("https://github.com/mrdidit/armada/tree/" + $revision) |
+            .Labels["org.opencontainers.image.base.name"] = $base |
+            .Labels["org.opencontainers.image.base.digest"] = ($base | split("@")[1]) |
+            .Labels["io.armada.test.pr712.commit"] = $pr |
+            del(.Labels["ostree.commit"], .Labels["ostree.final-diffid"])' \
+            "$RUNNER_TEMP/evidence/base-config.json" > "$RUNNER_TEMP/evidence/runtime-config.json"
+          hash=$(packages/package-hash.sh kernel)
+          echo "kernel_ref=localhost/armada-pr712-kernel:$hash" >> "$GITHUB_OUTPUT"
+          echo "kernel_hash=$hash" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "cache_dir=/var/tmp/buildah-cache-$(id -u)" >> "$GITHUB_OUTPUT"
+          cp build_files/pr712-test.env build_files/pr712-test-signing.pub "$RUNNER_TEMP/evidence/"
+
+      - name: Restore kernel compiler cache
+        uses: actions/cache@640a1c2554105b57832a23eea0b4672fc7a790d5 # v4.2.3
+        with:
+          path: ${{ steps.prepare.outputs.cache_dir }}
+          key: ccache-pr712-kernel-${{ runner.arch }}-${{ hashFiles('packages/toolchain.env') }}-${{ steps.prepare.outputs.kernel_hash }}
+          restore-keys: |
+            ccache-pr712-kernel-${{ runner.arch }}-${{ hashFiles('packages/toolchain.env') }}-
+
+      - name: Build only the PR 712 kernel package
+        env:
+          KERNEL_REF: ${{ steps.prepare.outputs.kernel_ref }}
+        run: |
+          set -euo pipefail
+          source packages/toolchain.env
+          source packages/mesa-x86/BASE.env
+          patch=0541-input-joystick-mcu-joystick-power-the-mcu-off-in-suspend.patch
+          test "$(grep -cxF "$patch" packages/kernel/patches/series)" -eq 1
+          grep -Eq '^CONFIG_JOYSTICK_MCU=y([[:space:]]|$)' packages/kernel/config/armada-kernel.config.overrides
+          sha256sum "packages/kernel/patches/$patch" > "$RUNNER_TEMP/evidence/pr712-patch.sha256"
+          # build-kernel.sh applies every hunk with zero fuzz and checks the
+          # resolved Kconfig before compiling. An unchanged package may use cache.
+          buildah build -f packages/Containerfile --target out-kernel --layers \
+            --cache-from ghcr.io/armada-os/armada/buildcache/kernel \
+            --build-arg "BUILDER_IMAGE=$BUILDER_IMAGE" \
+            --build-arg "GUEST_BUILDER_IMAGE=$GUEST_BUILDER_IMAGE" \
+            -t "$KERNEL_REF" packages/ 2>&1 | tee "$RUNNER_TEMP/evidence/kernel-build.log"
+
+      - name: Verify the compiled suspend code and kernel provenance
+        env:
+          KERNEL_REF: ${{ steps.prepare.outputs.kernel_ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/kernel-package"
+          buildah unshare bash <<'EXTRACT_KERNEL'
+          set -euo pipefail
+          container=$(buildah from "$KERNEL_REF")
+          trap 'buildah rm "$container" >/dev/null' EXIT
+          root=$(buildah mount "$container")
+          cp "$root"/kernel/armada-kernel-*.tar.zst* "$RUNNER_TEMP/kernel-package/"
+          EXTRACT_KERNEL
+          shopt -s nullglob
+          archives=("$RUNNER_TEMP"/kernel-package/armada-kernel-*.tar.zst)
+          test "${#archives[@]}" -eq 1
+          archive="${archives[0]}"
+          kver="${archive##*/armada-kernel-}"
+          kver="${kver%.tar.zst}"
+          source packages/kernel/BASE.env
+          test "$kver" = "$VERSION"
+          (cd "$RUNNER_TEMP/kernel-package" && sha256sum -c "${archive##*/}.sha256")
+          tar --zstd -xOf "$archive" "lib/modules/$kver/vmlinuz" > "$RUNNER_TEMP/pr712-vmlinuz"
+          for marker in 'mcu_joystick.power_off_in_suspend' 'MCU power cut for suspend' 'resume: power cycling the MCU'; do
+            grep -aFq "$marker" "$RUNNER_TEMP/pr712-vmlinuz"
+          done
+          tar --zstd -xOf "$archive" "lib/modules/$kver/.armada-source" > "$RUNNER_TEMP/evidence/kernel-source.txt"
+          count=$(sed 's/#.*//' packages/kernel/patches/series | awk 'NF {n++} END {print n+0}')
+          grep -Fx "Patches applied: $count (from patches/series)" "$RUNNER_TEMP/evidence/kernel-source.txt"
+          grep -Fx 'Built: armada-builder on aarch64' "$RUNNER_TEMP/evidence/kernel-source.txt"
+          cp "$archive.sha256" "$RUNNER_TEMP/evidence/"
+          rm -f "$RUNNER_TEMP/pr712-vmlinuz"
+
+      - name: Assemble and rechunk the kernel update
+        env:
+          KERNEL_REF: ${{ steps.prepare.outputs.kernel_ref }}
+          ARMADA_VERSION: ${{ steps.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          source build_files/pr712-test.env
+          buildah build --storage-opt=overlay.mount_program= \
+            --format docker --target chunkah --skip-unused-stages=false \
+            --security-opt label=disable --volume "$RUNNER_TEMP:/run/src" \
+            --build-arg "BASE_IMAGE=$PR712_BASE_IMAGE" \
+            --build-arg "KERNEL_REF=$KERNEL_REF" \
+            --build-arg "ARMADA_VERSION=$ARMADA_VERSION" \
+            --build-arg "CHUNKAH_CONFIG_STR=$(jq -c . "$RUNNER_TEMP/evidence/runtime-config.json")" \
+            -f Containerfile.pr712-test -t localhost/armada-pr712-assembly .
+
+      - name: Validate the serialized bootc image
+        run: |
+          set -euo pipefail
+          for component in steam proton fex-rootfs; do
+            grep -Eq "creating tar layer .*\"xattr/$component\"" "$RUNNER_TEMP/chunkah.log"
+          done
+          skopeo inspect --raw "oci:$RUNNER_TEMP/chunked" > "$RUNNER_TEMP/evidence/manifest.json"
+          skopeo inspect --config "oci:$RUNNER_TEMP/chunked" > "$RUNNER_TEMP/evidence/config.json"
+          jq -e '(.layers | length) > 1 and (.layers | length) <= 128 and
+            ((.annotations // {}) | has("ostree.commit") | not) and
+            ((.annotations // {}) | has("ostree.final-diffid") | not)' "$RUNNER_TEMP/evidence/manifest.json"
+          jq -e --slurpfile expected "$RUNNER_TEMP/evidence/runtime-config.json" '
+            .config == $expected[0] and .architecture == "arm64" and .os == "linux" and
+            .config.Cmd == ["/sbin/init"] and
+            .config.Labels["containers.bootc"] == "1" and
+            .config.Labels["ostree.bootable"] == "true"' "$RUNNER_TEMP/evidence/config.json"
+          python3 build_files/verify-steam-bootstrap.py --oci "$RUNNER_TEMP/chunked"
+          cp "$RUNNER_TEMP/chunkah.log" "$RUNNER_TEMP/evidence/"
+
+      - name: Publish and sign the exact test digest
+        id: publish
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+          SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
+          VERSION: ${{ steps.prepare.outputs.version }}
+          KERNEL_HASH: ${{ steps.prepare.outputs.kernel_hash }}
+          COSIGN_PASSWORD: ''
+        run: |
+          set -euo pipefail
+          source build_files/pr712-test.env
+          test "$TEST_IMAGE" = ghcr.io/mrdidit/armada
+          test "$TEST_TAG" = test-pr712-konkr-suspend-20261013
+          printf '%s' "$REGISTRY_TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          printf '%s' "$REGISTRY_TOKEN" | cosign login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          build_tag="build-$VERSION-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          skopeo copy --all "oci:$RUNNER_TEMP/chunked" "docker://$TEST_IMAGE:$build_tag"
+          digest=$(skopeo inspect --format '{{.Digest}}' "docker://$TEST_IMAGE:$build_tag")
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          umask 077
+          keydir=$(mktemp -d "$RUNNER_TEMP/pr712-signing.XXXXXXXX")
+          trap 'rm -f -- "$keydir/original.pem" "$keydir/imported.key" "$keydir/imported.pub" "$keydir/imported.der"; rmdir "$keydir"' EXIT
+          printf '%s\n' "$SIGNING_SECRET" > "$keydir/original.pem"
+          unset SIGNING_SECRET
+          cosign import-key-pair --key "$keydir/original.pem" --output-key-prefix "$keydir/imported"
+          openssl pkey -pubin -in "$keydir/imported.pub" -outform DER > "$keydir/imported.der"
+          cmp "$keydir/imported.der" "$RUNNER_TEMP/expected-public.der"
+          cosign sign -y --new-bundle-format=false --key "$keydir/imported.key" "$TEST_IMAGE@$digest"
+          cosign verify --key build_files/pr712-test-signing.pub "$TEST_IMAGE@$digest" > "$RUNNER_TEMP/evidence/signature.json"
+          jq -e --arg digest "$digest" --arg image "$TEST_IMAGE" 'any(.[];
+            .critical.image["docker-manifest-digest"] == $digest and
+            .critical.identity["docker-reference"] == $image)' "$RUNNER_TEMP/evidence/signature.json"
+          skopeo copy --all "docker://$TEST_IMAGE@$digest" "docker://$TEST_IMAGE:$TEST_TAG"
+          test "$(skopeo inspect --format '{{.Digest}}' "docker://$TEST_IMAGE:$TEST_TAG")" = "$digest"
+          jq -n --arg image "$TEST_IMAGE@$digest" --arg tag "$TEST_TAG" --arg build_tag "$build_tag" \
+            --arg base "$PR712_BASE_IMAGE" --arg base_version "$PR712_BASE_VERSION" \
+            --arg base_revision "$PR712_BASE_REVISION" --arg pr "$PR712_COMMIT" \
+            --arg revision "$GITHUB_SHA" --arg kernel_hash "$KERNEL_HASH" \
+            '{image:$image, tag:$tag, build_tag:$build_tag, base:$base, base_version:$base_version,
+              base_revision:$base_revision, pr712_commit:$pr, revision:$revision, kernel_hash:$kernel_hash,
+              hardware_tested:false}' > "$RUNNER_TEMP/evidence/build.json"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          {
+            printf '### PR 712 signed test image\n\n'
+            printf 'Image: `%s@%s`\n\n' "$TEST_IMAGE" "$digest"
+            printf 'Test tag: `%s:%s`\n\n' "$TEST_IMAGE" "$TEST_TAG"
+            printf 'Base: `%s` (%s)\n\n' "$PR712_BASE_IMAGE" "$PR712_BASE_VERSION"
+            printf 'PR commit: `%s`\n\nBuild commit: `%s`\n\n' "$PR712_COMMIT" "$GITHUB_SHA"
+            printf 'Kernel replacement, initramfs regeneration, bootc lint and image checks passed. Hardware testing is still required.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build provenance and validation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr712-build-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+          retention-days: 30
+
+  disk:
+    name: Build flashable test disk
+    needs: image
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Free build space
+        uses: ublue-os/remove-unwanted-software@cc0becac701cf642c8f0a6613bbdaf5dc36b259e # v9
+        with:
+          remove-codeql: true
+
+      - name: Check out the exact build commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install disk tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends containernetworking-plugins podman jq skopeo
+
+      - name: Install just
+        uses: ublue-os/just-action@30ab4659369934b65b655bf8d2fa4ddd6547d384 # v3
+
+      - name: Build disk from the signed image digest
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+          ARMADA_IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$REGISTRY_TOKEN" | sudo podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          just_bin=$(command -v just)
+          sudo git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sudo env PATH="$PATH" ARMADA_IMAGE_DIGEST="$ARMADA_IMAGE_DIGEST" \
+            "$just_bin" build-armada-image "$TEST_IMAGE" "$TEST_TAG"
+          sudo chown -R "$(id -u):$(id -g)" output
+          inspection=$(sudo podman image inspect "$TEST_IMAGE:$TEST_TAG")
+          test "$(jq -r '.[0].Digest' <<< "$inspection")" = "$ARMADA_IMAGE_DIGEST"
+          test "$(jq -r '.[0].Config.Labels["org.opencontainers.image.revision"]' <<< "$inspection")" = "$GITHUB_SHA"
+
+      - name: Check and checksum the disk image
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          images=(output/armada-*.img.gz)
+          test "${#images[@]}" -eq 1
+          test -s "${images[0]}"
+          gzip -t "${images[0]}"
+          filename="${images[0]##*/}"
+          (cd output && sha256sum "$filename" > "$filename.sha256")
+          printf 'Flashable image: `%s`; artifact retained for seven days.\n' "$filename" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload flashable disk and checksum
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: armada-pr712-test-disk-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            output/armada-*.img.gz
+            output/armada-*.img.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
