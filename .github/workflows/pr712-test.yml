@@ -6,6 +6,15 @@ on:
     branches:
       - test-pr712-konkr-suspend-20261013
   workflow_dispatch:
+    inputs:
+      image_digest:
+        description: 'Optional signed PR 712 image digest to retry only the disk build (sha256:...)'
+        type: string
+        required: false
+      image_revision:
+        description: 'Full source commit of the reused image; required with image_digest'
+        type: string
+        required: false
 
 permissions: {}
 
@@ -16,10 +25,12 @@ concurrency:
 env:
   TEST_IMAGE: ghcr.io/mrdidit/armada
   TEST_TAG: test-pr712-konkr-suspend-20261013
+  # ARM64 child of the 2026-06-18 multiarch build. The 2026-10-13 latest is AMD64-only.
+  BIB_IMAGE: quay.io/centos-bootc/bootc-image-builder@sha256:a4779fc2307a7c2e82fda09e5c7712871fdb2dfae8a587f61d1dab32e7c4edc8
 
 jobs:
   image:
-    if: github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-pr712-konkr-suspend-20261013'
+    if: github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-pr712-konkr-suspend-20261013' && !inputs.image_digest
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 240
     permissions:
@@ -269,11 +280,19 @@ jobs:
   disk:
     name: Build flashable test disk
     needs: image
+    if: >-
+      !cancelled() && github.repository == 'mrdidit/armada' &&
+      github.ref == 'refs/heads/test-pr712-konkr-suspend-20261013' &&
+      (needs.image.result == 'success' ||
+       (needs.image.result == 'skipped' && inputs.image_digest != ''))
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
     permissions:
       contents: read
       packages: read
+    env:
+      ARMADA_IMAGE_DIGEST: ${{ inputs.image_digest || needs.image.outputs.digest }}
+      IMAGE_REVISION: ${{ inputs.image_digest && inputs.image_revision || github.sha }}
     steps:
       - name: Free build space
         uses: ublue-os/remove-unwanted-software@cc0becac701cf642c8f0a6613bbdaf5dc36b259e # v9
@@ -290,26 +309,77 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends containernetworking-plugins podman jq skopeo
+          sudo apt-get install -y --no-install-recommends containernetworking-plugins podman jq skopeo dosfstools fdisk pigz
 
       - name: Install just
         uses: ublue-os/just-action@30ab4659369934b65b655bf8d2fa4ddd6547d384 # v3
 
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.6.3
+
+      - name: Verify signed disk source and native ARM64 builder
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+          REUSE_DIGEST: ${{ inputs.image_digest }}
+          REUSE_REVISION: ${{ inputs.image_revision }}
+        run: |
+          set -euo pipefail
+          [[ "$ARMADA_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$IMAGE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          if [[ -n "$REUSE_DIGEST" && -z "$REUSE_REVISION" ]]; then
+            echo '::error::image_revision is required when reusing an image digest.'
+            exit 1
+          fi
+          source build_files/pr712-test.env
+          mkdir -p "$RUNNER_TEMP/disk-evidence"
+          export DOCKER_CONFIG="$RUNNER_TEMP/disk-registry-auth"
+          mkdir -p "$DOCKER_CONFIG"
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          printf '%s' "$REGISTRY_TOKEN" | skopeo login --authfile "$DOCKER_CONFIG/config.json" \
+            ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          cosign verify --key build_files/pr712-test-signing.pub \
+            "$TEST_IMAGE@$ARMADA_IMAGE_DIGEST" > "$RUNNER_TEMP/disk-evidence/image-signature.json"
+          skopeo inspect --authfile "$DOCKER_CONFIG/config.json" --config \
+            "docker://$TEST_IMAGE@$ARMADA_IMAGE_DIGEST" > "$RUNNER_TEMP/disk-evidence/image-config.json"
+          jq -e --arg revision "$IMAGE_REVISION" --arg base "$PR712_BASE_IMAGE" --arg pr "$PR712_COMMIT" '
+            .architecture == "arm64" and .os == "linux" and
+            .config.Cmd == ["/sbin/init"] and
+            .config.Labels["org.opencontainers.image.revision"] == $revision and
+            .config.Labels["org.opencontainers.image.base.name"] == $base and
+            .config.Labels["io.armada.test.pr712.commit"] == $pr' \
+            "$RUNNER_TEMP/disk-evidence/image-config.json"
+          skopeo inspect --override-arch arm64 --config "docker://$BIB_IMAGE" \
+            > "$RUNNER_TEMP/disk-evidence/builder-config.json"
+          jq -e '.architecture == "arm64" and .os == "linux"' \
+            "$RUNNER_TEMP/disk-evidence/builder-config.json"
+          printf 'Disk source: `%s@%s`\n\nSource revision: `%s`\n\nBuilder: `%s`\n' \
+            "$TEST_IMAGE" "$ARMADA_IMAGE_DIGEST" "$IMAGE_REVISION" "$BIB_IMAGE" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Build disk from the signed image digest
         env:
           REGISTRY_TOKEN: ${{ github.token }}
-          ARMADA_IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
         run: |
           set -euo pipefail
           printf '%s' "$REGISTRY_TOKEN" | sudo podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           just_bin=$(command -v just)
           sudo git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          sudo env PATH="$PATH" ARMADA_IMAGE_DIGEST="$ARMADA_IMAGE_DIGEST" \
+          sudo env PATH="$PATH" ARMADA_IMAGE_DIGEST="$ARMADA_IMAGE_DIGEST" BIB_IMAGE="$BIB_IMAGE" \
             "$just_bin" build-armada-image "$TEST_IMAGE" "$TEST_TAG"
           sudo chown -R "$(id -u):$(id -g)" output
           inspection=$(sudo podman image inspect "$TEST_IMAGE:$TEST_TAG")
           test "$(jq -r '.[0].Digest' <<< "$inspection")" = "$ARMADA_IMAGE_DIGEST"
-          test "$(jq -r '.[0].Config.Labels["org.opencontainers.image.revision"]' <<< "$inspection")" = "$GITHUB_SHA"
+          test "$(jq -r '.[0].Config.Labels["org.opencontainers.image.revision"]' <<< "$inspection")" = "$IMAGE_REVISION"
+
+      - name: Upload disk source and builder evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr712-disk-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/disk-evidence/
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Check and checksum the disk image
         run: |
