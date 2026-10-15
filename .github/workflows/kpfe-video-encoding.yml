@@ -121,9 +121,18 @@ jobs:
           sha256sum packages/kernel/dts/sm8750-konkr-pf-elite.dts.patch \
             system_files/usr/lib/udev/rules.d/70-armada-video-codec.rules \
             > "$RUNNER_TEMP/evidence/codec-inputs.sha256"
-          buildah build -f Containerfile.kpfe-video-encoding-dtb --target out-dtb --layers \
+          # The image context excludes packages/. Stage only the DTB inputs
+          # without changing those normal image-build exclusions.
+          dtb_context="$RUNNER_TEMP/kpfe-dtb-context"
+          mkdir -p "$dtb_context/packages" "$dtb_context/build_files"
+          cp -a packages/kernel "$dtb_context/packages/"
+          cp build_files/kpfe-video-encoding.env build_files/kpfe-video-encoding-dtb.sh \
+            "$dtb_context/build_files/"
+          cp Containerfile.kpfe-video-encoding-dtb "$dtb_context/"
+          buildah build --storage-opt=overlay.mount_program= \
+            -f "$dtb_context/Containerfile.kpfe-video-encoding-dtb" --target out-dtb --layers \
             --build-arg "BUILDER_IMAGE=$BUILDER_IMAGE" \
-            -t "$DTB_REF" . 2>&1 | tee "$RUNNER_TEMP/evidence/dtb-build.log"
+            -t "$DTB_REF" "$dtb_context" 2>&1 | tee "$RUNNER_TEMP/evidence/dtb-build.log"
 
       - name: Verify only the Iris status changes in the compiled device tree
         env:
