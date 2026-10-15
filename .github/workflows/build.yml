@@ -1,307 +1,111 @@
 ---
-name: Build images
-on:
-  push:
-    branches:
-      - main
-      - staging
-  workflow_dispatch:
+name: Publish verified PR 737 test image
 
-env:
-  ARMADA_CANONICAL_IMAGE: "ghcr.io/armada-os/armada"
-  ARMADA_LEGACY_IMAGE: "ghcr.io/virtudude/armada"
-  BASE_IMAGE: "quay.io/fedora/fedora-bootc:44"
-  IMAGE_DESC: "Armada: a gaming-focused, SteamOS-like Fedora bootc image for ARM64 handhelds"
-  IMAGE_NAME: "${{ github.event.repository.name }}"
-  IMAGE_REGISTRY: "ghcr.io/${{ github.repository_owner }}"
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_run_id:
+        description: Completed armada-os/armada PR workflow run ID
+        required: true
+        type: string
+      upstream_run_attempt:
+        description: Successful run attempt number
+        required: true
+        type: string
+      expected_head_sha:
+        description: Full PR 737 head commit SHA
+        required: true
+        type: string
+      expected_merge_sha:
+        description: Full synthetic merge SHA used by the upstream build
+        required: true
+        type: string
+      expected_tree_sha:
+        description: Expected Git tree SHA shared by the PR head and merge
+        required: true
+        type: string
+      artifact_id:
+        description: Immutable armada-container-pr737 artifact ID
+        required: true
+        type: string
+      artifact_sha256:
+        description: SHA256 of the artifact ZIP from the GitHub API (64 hex digits)
+        required: true
+        type: string
+
+permissions: {}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: pr737-artifact-publisher
   cancel-in-progress: false
-  queue: max
 
 jobs:
-  packages:
-    name: Packages
+  publish:
+    if: github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-pr737-artifact-publisher-20261015'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     permissions:
       contents: read
+      actions: read
       packages: write
-    uses: ./.github/workflows/packages.yml
-    secrets: inherit
-
-  build_push:
-    name: Container image
-    needs: packages
-    runs-on: ubuntu-24.04-arm
-    outputs:
-      channel: ${{ steps.channel.outputs.channel }}
-      tag: ${{ steps.channel.outputs.tag }}
-      digest: ${{ steps.push.outputs.digest }}
-      revision: ${{ steps.version.outputs.revision }}
-
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-
+    env:
+      PR737_RUN_ID: ${{ inputs.upstream_run_id }}
+      PR737_RUN_ATTEMPT: ${{ inputs.upstream_run_attempt }}
+      PR737_HEAD_SHA: ${{ inputs.expected_head_sha }}
+      PR737_MERGE_SHA: ${{ inputs.expected_merge_sha }}
+      PR737_TREE_SHA: ${{ inputs.expected_tree_sha }}
+      PR737_ARTIFACT_ID: ${{ inputs.artifact_id }}
+      PR737_ARTIFACT_SHA256: ${{ inputs.artifact_sha256 }}
     steps:
-      - name: Prepare environment
-        run: |
-          echo "IMAGE_REGISTRY=${IMAGE_REGISTRY,,}" >> ${GITHUB_ENV}
-          echo "IMAGE_NAME=${IMAGE_NAME,,}" >> ${GITHUB_ENV}
-
-      - name: Resolve publication channel
-        id: channel
-        env:
-          BUILD_REF: ${{ github.ref }}
-        run: |
-          set -euo pipefail
-          if [[ "${BUILD_REF}" != refs/heads/* ]]; then
-            echo "::error::Select a branch to build."
-            exit 1
-          fi
-          branch="${BUILD_REF#refs/heads/}"
-          case "${branch}" in
-            main) tag=testing; channel=preview ;;
-            staging) tag=staging; channel=staging ;;
-            testing|preview|beta|stable|latest)
-              echo "::error::Reserved release channel. Build main/staging or use Promote channel."
-              exit 1 ;;
-            *) tag="${branch}"; channel="" ;;
-          esac
-          if ! [[ "${tag}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
-            echo "::error::Branch cannot be used as a container tag."
-            exit 1
-          fi
-          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
-          echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
-
-      - name: Install container tools
-        run: |
-          set -euxo pipefail
-          # ubuntu-24.04 dropped these from the runner image; the build action,
-          # validation, and push all need them.
-          need=""
-          for t in buildah jq skopeo; do
-            command -v "$t" >/dev/null || need="$need $t"
-          done
-          [ -z "$need" ] || { sudo apt-get update && sudo apt-get install -y $need; }
-
-      - name: Check signing key
-        run: |
-          if [ -z "${{ secrets.SIGNING_SECRET }}" ]; then
-            echo "::error::SIGNING_SECRET is not set — refusing to publish an unsigned image (devices verify ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }})."
-            exit 1
-          fi
-
-      - name: Check out source
+      - name: Check out the publisher only
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          persist-credentials: false
 
-      - name: Install just
-        uses: ublue-os/just-action@30ab4659369934b65b655bf8d2fa4ddd6547d384 # v3
-
-      - name: Get image version
-        id: version
-        run: |
-          echo "created=$(date -u +%Y\-%m\-%d\T%H\:%M\:%S\Z)" >> $GITHUB_OUTPUT
-          echo "version=$(TZ=America/New_York date +%Y%m%d).$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Generate image metadata
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        id: metadata
+      - name: Free artifact storage
+        uses: ublue-os/remove-unwanted-software@cc0becac701cf642c8f0a6613bbdaf5dc36b259e # v9
         with:
-          tags: |
-            type=raw,value=${{ steps.channel.outputs.tag }}
-          labels: |
-            org.opencontainers.image.revision=${{ steps.version.outputs.revision }}
-            org.opencontainers.image.created=${{ steps.version.outputs.created }}
-            org.opencontainers.image.description=${{ env.IMAGE_DESC }}
-            org.opencontainers.image.documentation=https://raw.githubusercontent.com/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}/${{ steps.version.outputs.revision }}/README.md
-            org.opencontainers.image.licenses=GPL-2.0-or-later
-            org.opencontainers.image.source=https://github.com/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}/blob/${{ steps.version.outputs.revision }}/Containerfile
-            org.opencontainers.image.title=${{ env.IMAGE_NAME }}
-            org.opencontainers.image.url=https://github.com/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}/tree/${{ steps.version.outputs.revision }}
-            org.opencontainers.image.vendor=${{ github.repository_owner }}
-            org.opencontainers.image.version=${{ steps.version.outputs.version }}
-            containers.bootc=1
-          sep-tags: " "
-          sep-annotations: " "
+          remove-codeql: true
 
-      - name: Prepare Chunkah config
-        id: chunkah_config
-        env:
-          METADATA_JSON: ${{ steps.metadata.outputs.json }}
+      - name: Install inspection tools
         run: |
           set -euo pipefail
-          base_digest=$(skopeo inspect --override-arch arm64 --format '{{.Digest}}' \
-            "docker://${BASE_IMAGE}")
-          base_image="${BASE_IMAGE%:*}@${base_digest}"
-          config=$(skopeo inspect --override-arch arm64 --config \
-            "docker://${base_image}" |
-            jq -c --argjson metadata "${METADATA_JSON}" '
-              .config |
-              .Labels = ((.Labels // {}) + ($metadata.labels // {})) |
-              del(.Labels["ostree.commit"]) |
-              del(.Labels["ostree.final-diffid"])')
-          printf '%s\n' "${config}" > "${RUNNER_TEMP}/chunkah-config.json"
-          echo "base_image=${base_image}" >> "${GITHUB_OUTPUT}"
-          echo "config=${config}" >> "${GITHUB_OUTPUT}"
-
-      - name: Resolve package refs
-        env:
-          BUILD_ARGS: ${{ needs.packages.outputs.build_args }}
-        run: |
-          set -euo pipefail
-          # One <PKG>_REF=<image> line per package, from the Packages workflow.
-          # Unchanged packages resolve to an image built by an earlier run.
-          printf '%s' "${BUILD_ARGS}" > "${RUNNER_TEMP}/package-refs.env"
-          expected=$(grep -c '^ARG [A-Z0-9_]*_REF$' Containerfile)
-          got=$(grep -c '_REF=' "${RUNNER_TEMP}/package-refs.env")
-          if [ "${expected}" -ne "${got}" ]; then
-            echo "::error::Containerfile wants ${expected} package refs, resolver gave ${got}"
-            exit 1
-          fi
-          echo "Resolved ${got} package refs:" && cat "${RUNNER_TEMP}/package-refs.env"
-
-      - name: Require native OverlayFS
-        run: |
-          set -euxo pipefail
-          buildah info --storage-opt=overlay.mount_program= |
-            jq -e '.store.GraphStatus["Native Overlay Diff"] == "true"'
-
-      - name: Build container image
-        id: build_image
-        uses: redhat-actions/buildah-build@719e3c40d8af9790c23eca13f7daa339f2867034 # v3.1.0
-        with:
-          containerfiles: |
-            ./Containerfile
-          image: ${{ env.IMAGE_NAME }}
-          tags: build-output
-          labels: ${{ steps.metadata.outputs.labels }}
-          build-args: |
-            ARMADA_VERSION=${{ steps.version.outputs.version }}
-            BASE_IMAGE=${{ steps.chunkah_config.outputs.base_image }}
-            CHUNKAH_CONFIG_STR=${{ steps.chunkah_config.outputs.config }}
-          # armada-rootfs is consumed through RUN --mount, so retain otherwise-unused stages.
-          extra-args: |
-            --build-arg-file=${{ runner.temp }}/package-refs.env
-            --skip-unused-stages=false
-            --target=chunkah
-            --volume=${{ runner.temp }}:/run/src
-            --security-opt=label=disable
-            --storage-opt=overlay.mount_program=
-          oci: false
-
-      - name: Validate Chunkah output
-        id: chunkah_output
-        run: ./.github/scripts/validate-chunkah-output.sh build
-
-      - name: Push container to GHCR
-        id: push
-        run: |
-          set -euxo pipefail
-          echo "${{ secrets.GITHUB_TOKEN }}" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
-          IMAGE_FULL="${IMAGE_REGISTRY}/${IMAGE_NAME}"
-          BUILD_TAG="build-${{ steps.version.outputs.version }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          n=0
-          until skopeo copy --all \
-                "${{ steps.chunkah_output.outputs.ref }}" "docker://${IMAGE_FULL}:${BUILD_TAG}"; do
-            n=$((n + 1)); [ "${n}" -ge 3 ] && exit 1; sleep 15
-          done
-          digest=$(skopeo inspect --format '{{.Digest}}' "docker://${IMAGE_FULL}:${BUILD_TAG}")
-          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends skopeo jq openssl
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        if: env.HAVE_SIGNING_SECRET == 'true'
-        env:
-          HAVE_SIGNING_SECRET: ${{ secrets.SIGNING_SECRET != '' }}
         with:
-          cosign-release: 'v2.6.3'
+          cosign-release: v2.6.3
 
-      - name: Sign container image
-        if: env.HAVE_SIGNING_SECRET == 'true'
+      - name: Verify the existing fork signing identity
+        env:
+          SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
         run: |
           set -euo pipefail
-          IMAGE_FULL="${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}"
-          IMAGE_REF="${IMAGE_FULL}@${{ steps.push.outputs.digest }}"
-          # Cosign and Skopeo use separate registry auth stores.
-          echo "${{ secrets.GITHUB_TOKEN }}" | cosign login ghcr.io -u "${{ github.actor }}" --password-stdin
-          # Sign the digest, not a tag (a concurrent run could re-point the tag).
-          # --new-bundle-format=false: bootc's verifier expects the legacy .sig; the
-          # default flips in cosign v3.
-          cosign sign -y --new-bundle-format=false --key env://COSIGN_PRIVATE_KEY "${IMAGE_REF}"
+          test -n "$SIGNING_SECRET"
+          printf '%s\n' "$SIGNING_SECRET" | openssl pkey -pubout -outform DER > "$RUNNER_TEMP/signing-public.der"
+          openssl pkey -pubin -in .github/keys/pr737-publisher.pub -outform DER > "$RUNNER_TEMP/expected-public.der"
+          cmp "$RUNNER_TEMP/signing-public.der" "$RUNNER_TEMP/expected-public.der"
 
-          # Legacy-hosted images also need the canonical identity required by bridge policy.
-          if [ "${IMAGE_FULL}" = "${ARMADA_LEGACY_IMAGE}" ]; then
-            cosign sign -y --new-bundle-format=false \
-              --key env://COSIGN_PRIVATE_KEY \
-              --sign-container-identity "${ARMADA_CANONICAL_IMAGE}" \
-              "${IMAGE_REF}"
-          fi
-
-          if [ "${{ github.event.repository.fork }}" != "true" ]; then
-            cosign verify --key system_files/etc/pki/containers/armada.pub "${IMAGE_REF}"
-            if [ "${IMAGE_FULL}" = "${ARMADA_LEGACY_IMAGE}" ]; then
-              cosign verify --check-claims=false \
-                --key system_files/etc/pki/containers/armada.pub \
-                "${IMAGE_REF}" |
-                jq -s -e --arg identity "${ARMADA_CANONICAL_IMAGE}" \
-                  'any(.. | objects; .critical?.identity?["docker-reference"]? == $identity)'
-            fi
-          fi
+      - name: Verify source and artifact, then inspect the OCI archive
         env:
-          HAVE_SIGNING_SECRET: ${{ secrets.SIGNING_SECRET != '' }}
-          TAGS: ${{ steps.push.outputs.digest }}
-          COSIGN_EXPERIMENTAL: false
-          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/prepare-pr737-artifact.py --output "$RUNNER_TEMP/pr737"
 
-      - name: Publish channel tags
-        if: env.HAVE_SIGNING_SECRET == 'true'
-        run: |
-          set -euo pipefail
-          IMAGE_FULL="${IMAGE_REGISTRY}/${IMAGE_NAME}"
-          SRC="docker://${IMAGE_FULL}@${{ steps.push.outputs.digest }}"
-          for tag in ${{ steps.metadata.outputs.tags }}; do
-            n=0
-            until skopeo copy --all "${SRC}" "docker://${IMAGE_FULL}:${tag}"; do
-              n=$((n + 1)); [ "${n}" -ge 3 ] && exit 1; sleep 15
-            done
-            tag_digest=$(skopeo inspect --format '{{.Digest}}' "docker://${IMAGE_FULL}:${tag}")
-            if [ "${tag_digest}" != "${{ steps.push.outputs.digest }}" ]; then
-              echo "::error::${tag} resolved to ${tag_digest}, not the signed digest ${{ steps.push.outputs.digest }}"
-              exit 1
-            fi
-          done
-          {
-            printf '### Signed container published\n\n'
-            printf 'Digest: `%s@%s`\n\n' "${IMAGE_FULL}" "${{ steps.push.outputs.digest }}"
-            printf 'Promote this exact build with source: `build-%s-%s-%s`\n' \
-              "${{ steps.version.outputs.version }}" "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}"
-          } >> "${GITHUB_STEP_SUMMARY}"
+      - name: Publish and sign the verified image digest
         env:
-          HAVE_SIGNING_SECRET: ${{ secrets.SIGNING_SECRET != '' }}
+          REGISTRY_TOKEN: ${{ github.token }}
+          SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ''
+        run: bash .github/scripts/publish-pr737-artifact.sh "$RUNNER_TEMP/pr737"
 
-  publish_disk:
-    name: Disk image
-    needs: build_push
-    if: >-
-      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging') &&
-      needs.build_push.outputs.channel != '' &&
-      github.event.repository.fork == false
-    permissions:
-      contents: read
-      packages: read
-    uses: ./.github/workflows/build-disk.yml
-    with:
-      tag: ${{ needs.build_push.outputs.tag }}
-      channel: ${{ needs.build_push.outputs.channel }}
-      publish_r2: true
-      image_digest: ${{ needs.build_push.outputs.digest }}
-      source_ref: ${{ needs.build_push.outputs.revision }}
-    secrets:
-      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      - name: Upload publication evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr737-publication-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pr737/evidence/
+          retention-days: 30
+          if-no-files-found: warn
