@@ -1,0 +1,12 @@
+# Build a small artifact independently of the image assembly stages.
+ARG BUILDER_IMAGE=registry.fedoraproject.org/fedora@sha256:0c6072366ebf8ea1c8c0f3a118aad3e9a9247d3065d499e54d62968f69351966
+
+FROM ${BUILDER_IMAGE} AS dtb-builder
+RUN dnf -y install gcc binutils make bc bison flex openssl-devel elfutils-libelf-devel \
+    xz patch curl perl-interpreter python3 findutils diffutils gawk grep sed coreutils tar
+COPY packages/kernel/ /src/kernel/
+COPY build_files/kpfe-video-encoding.env build_files/kpfe-video-encoding-dtb.sh /src/
+RUN /bin/bash /src/kpfe-video-encoding-dtb.sh
+
+FROM scratch AS out-dtb
+COPY --from=dtb-builder /out/ /dtb/

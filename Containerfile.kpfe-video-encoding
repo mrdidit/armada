@@ -1,0 +1,40 @@
+# Compile only the KPFE device tree; keep the official kernel and initramfs.
+ARG BASE_IMAGE=ghcr.io/armada-os/armada@sha256:7c2270888658e06e7419a4365b4224a46d81aec52c74c5d1f50b9cda7c066568
+ARG CHUNKAH_IMAGE=quay.io/coreos/chunkah@sha256:ff8b8b466a942ec6000445d4001fc661e2fc5a952ad9ee29b4de9ab09d1d1708
+ARG DTB_REF
+
+FROM ${DTB_REF} AS dtb-artifact
+
+FROM scratch AS ctx
+COPY build_files/52-configure-os-release.sh build_files/kpfe-video-encoding.env build_files/kpfe-video-encoding-overlay.sh /build_files/
+COPY system_files/usr/lib/udev/rules.d/70-armada-video-codec.rules /system_files/usr/lib/udev/rules.d/
+
+FROM ${BASE_IMAGE} AS armada-rootfs
+ARG BASE_IMAGE
+ARG DTB_REF
+ARG ARMADA_VERSION
+LABEL org.opencontainers.image.version="${ARMADA_VERSION}"
+
+RUN --network=none \
+    --mount=type=bind,from=ctx,source=/,target=/ctx \
+    --mount=type=bind,from=dtb-artifact,source=/dtb,target=/dtb \
+    --mount=type=tmpfs,dst=/tmp \
+    /bin/bash /ctx/build_files/kpfe-video-encoding-overlay.sh
+
+RUN --network=none bootc container lint
+
+# Preserve the base image's runtime config and bootc component layer layout.
+FROM ${CHUNKAH_IMAGE} AS chunkah
+ARG CHUNKAH_CONFIG_STR
+RUN --mount=from=armada-rootfs,target=/chunkah,ro \
+    /bin/bash -o pipefail -c ' \
+        set -e; \
+        chunkah build --verbose --compressed --compression-level 6 \
+            --arch arm64 --max-layers 128 --source-date-epoch 0 \
+            --prune /sysroot/ \
+            --label ostree.commit- --label ostree.final-diffid- \
+            --config-str "${CHUNKAH_CONFIG_STR}" \
+            --output oci:/run/src/chunked 2>&1 | tee /run/src/chunkah.log \
+    '
+
+FROM armada-rootfs AS armada

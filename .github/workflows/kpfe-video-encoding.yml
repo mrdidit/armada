@@ -1,0 +1,270 @@
+---
+name: Build KPFE video encoding test
+
+on:
+  push:
+    branches:
+      - feat/kpfe-video-encoding-20261015
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: kpfe-video-encoding-test
+  cancel-in-progress: false
+
+env:
+  TEST_IMAGE: ghcr.io/mrdidit/armada
+  TEST_TAG: test-kpfe-video-encoding-20261015
+
+jobs:
+  image:
+    if: github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/feat/kpfe-video-encoding-20261015'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+      version: ${{ steps.prepare.outputs.version }}
+    steps:
+      - name: Require the existing fork signing key
+        env:
+          SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SIGNING_SECRET" ]; then
+            echo '::error::SIGNING_SECRET is missing; refusing to build an unsigned test image.'
+            exit 1
+          fi
+
+      - name: Check out the exact build commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify the fork signing identity before compiling
+        env:
+          SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$SIGNING_SECRET" | openssl pkey -pubout -outform DER > "$RUNNER_TEMP/signing-public.der"
+          openssl pkey -pubin -in build_files/kpfe-video-encoding-signing.pub -outform DER > "$RUNNER_TEMP/expected-public.der"
+          cmp "$RUNNER_TEMP/signing-public.der" "$RUNNER_TEMP/expected-public.der"
+
+      - name: Free build space
+        uses: ublue-os/remove-unwanted-software@cc0becac701cf642c8f0a6613bbdaf5dc36b259e # v9
+        with:
+          remove-codeql: true
+
+      - name: Install container tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends buildah skopeo jq runc zstd binutils openssl device-tree-compiler
+          mkdir -p "$HOME/.config/containers"
+          printf '[engine]\nruntime = "runc"\n' > "$HOME/.config/containers/containers.conf"
+          buildah info --storage-opt=overlay.mount_program= |
+            jq -e '.store.GraphStatus["Native Overlay Diff"] == "true"'
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.6.3
+
+      - name: Verify the pinned testing base and prepare metadata
+        id: prepare
+        run: |
+          set -euo pipefail
+          source build_files/kpfe-video-encoding.env
+          mkdir -p "$RUNNER_TEMP/evidence"
+          cosign verify --key system_files/etc/pki/containers/armada.pub \
+            "$KPFE_ENCODING_BASE_IMAGE" > "$RUNNER_TEMP/evidence/base-signature.json"
+          skopeo inspect --override-arch arm64 --config "docker://$KPFE_ENCODING_BASE_IMAGE" \
+            > "$RUNNER_TEMP/evidence/base-config.json"
+          jq -e --arg version "$KPFE_ENCODING_BASE_VERSION" --arg revision "$KPFE_ENCODING_BASE_REVISION" '
+            .architecture == "arm64" and .os == "linux" and
+            .config.Cmd == ["/sbin/init"] and
+            .config.Labels["org.opencontainers.image.version"] == $version and
+            .config.Labels["org.opencontainers.image.revision"] == $revision' \
+            "$RUNNER_TEMP/evidence/base-config.json"
+          version="20261015.kpfe-encoding.${GITHUB_SHA:0:7}"
+          jq --arg version "$version" --arg revision "$GITHUB_SHA" --arg base "$KPFE_ENCODING_BASE_IMAGE" '
+            .config |
+            .Labels["org.opencontainers.image.version"] = $version |
+            .Labels["org.opencontainers.image.revision"] = $revision |
+            .Labels["org.opencontainers.image.created"] = (now | todateiso8601) |
+            .Labels["org.opencontainers.image.description"] = "Armada testing with KPFE Iris video codec enabled" |
+            .Labels["org.opencontainers.image.source"] = ("https://github.com/mrdidit/armada/tree/" + $revision) |
+            .Labels["org.opencontainers.image.base.name"] = $base |
+            .Labels["org.opencontainers.image.base.digest"] = ($base | split("@")[1]) |
+            .Labels["io.armada.test.kpfe-video-encoding"] = "1" |
+            del(.Labels["ostree.commit"], .Labels["ostree.final-diffid"])' \
+            "$RUNNER_TEMP/evidence/base-config.json" > "$RUNNER_TEMP/evidence/runtime-config.json"
+          hash=$( { packages/package-hash.sh kernel;
+            sha256sum Containerfile.kpfe-video-encoding-dtb build_files/kpfe-video-encoding-dtb.sh \
+              build_files/kpfe-video-encoding.env; } | sha256sum | cut -c1-32)
+          echo "dtb_ref=localhost/armada-kpfe-encoding-dtb:$hash" >> "$GITHUB_OUTPUT"
+          echo "dtb_input_hash=$hash" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          cp build_files/kpfe-video-encoding.env build_files/kpfe-video-encoding-signing.pub "$RUNNER_TEMP/evidence/"
+
+      - name: Compile only the KPFE device tree
+        env:
+          DTB_REF: ${{ steps.prepare.outputs.dtb_ref }}
+        run: |
+          set -euo pipefail
+          source packages/toolchain.env
+          sha256sum packages/kernel/dts/sm8750-konkr-pf-elite.dts.patch \
+            system_files/usr/lib/udev/rules.d/70-armada-video-codec.rules \
+            > "$RUNNER_TEMP/evidence/codec-inputs.sha256"
+          buildah build -f Containerfile.kpfe-video-encoding-dtb --target out-dtb --layers \
+            --build-arg "BUILDER_IMAGE=$BUILDER_IMAGE" \
+            -t "$DTB_REF" . 2>&1 | tee "$RUNNER_TEMP/evidence/dtb-build.log"
+
+      - name: Verify only the Iris status changes in the compiled device tree
+        env:
+          DTB_REF: ${{ steps.prepare.outputs.dtb_ref }}
+        run: |
+          set -euo pipefail
+          source build_files/kpfe-video-encoding.env
+          export KPFE_ENCODING_BASE_IMAGE KPFE_ENCODING_KERNEL_VERSION
+          buildah unshare bash <<'EXTRACT_DTB'
+          set -euo pipefail
+          containers=()
+          cleanup() { for c in "${containers[@]}"; do buildah rm "$c" >/dev/null; done; }
+          trap cleanup EXIT
+          container=$(buildah from "$DTB_REF")
+          containers+=("$container")
+          root=$(buildah mount "$container")
+          cp "$root"/dtb/* "$RUNNER_TEMP/evidence/"
+          container=$(buildah from "$KPFE_ENCODING_BASE_IMAGE")
+          containers+=("$container")
+          root=$(buildah mount "$container")
+          cp "$root/usr/lib/modules/$KPFE_ENCODING_KERNEL_VERSION/dtb/qcom/sm8750-konkr-pf-elite.dtb" \
+            "$RUNNER_TEMP/evidence/base-kpfe.dtb"
+          cp "$root/usr/lib/modules/$KPFE_ENCODING_KERNEL_VERSION/.armada-source" \
+            "$RUNNER_TEMP/evidence/base-kernel-source.txt"
+          EXTRACT_DTB
+          (cd "$RUNNER_TEMP/evidence" && sha256sum -c SHA256SUMS)
+          dtb="$RUNNER_TEMP/evidence/sm8750-konkr-pf-elite.dtb"
+          base_dtb="$RUNNER_TEMP/evidence/base-kpfe.dtb"
+          node=/soc@0/video-codec@aa00000
+          test "$(fdtget -t s "$dtb" "$node" status)" = okay
+          test "$(fdtget -t s "$base_dtb" "$node" status)" = disabled
+          test "$(fdtget -t s "$dtb" "$node" compatible)" = qcom,sm8750-iris
+          properties=$(fdtget -p "$dtb" "$node")
+          if grep -Fxq firmware-name <<< "$properties"; then
+            echo '::error::KPFE must use the verified default Iris firmware.'
+            exit 1
+          fi
+          cp "$base_dtb" "$RUNNER_TEMP/compare-kpfe.dtb"
+          fdtput -t s "$RUNNER_TEMP/compare-kpfe.dtb" "$node" status okay
+          dtc -q -s -I dtb -O dts "$RUNNER_TEMP/compare-kpfe.dtb" > "$RUNNER_TEMP/compare-kpfe.dts"
+          dtc -q -s -I dtb -O dts "$dtb" > "$RUNNER_TEMP/evidence/kpfe-codec.dts"
+          cmp "$RUNNER_TEMP/compare-kpfe.dts" "$RUNNER_TEMP/evidence/kpfe-codec.dts"
+          dtc -q -s -I dtb -O dts "$base_dtb" > "$RUNNER_TEMP/evidence/base-kpfe.dts"
+          for source_file in dtb-source.txt base-kernel-source.txt; do
+            grep -Fx "Patches applied: $KPFE_ENCODING_PATCH_COUNT (from patches/series)" \
+              "$RUNNER_TEMP/evidence/$source_file"
+          done
+          sha256sum "$dtb" "$base_dtb" > "$RUNNER_TEMP/evidence/codec-artifacts.sha256"
+
+      - name: Assemble and rechunk the DTB update
+        env:
+          DTB_REF: ${{ steps.prepare.outputs.dtb_ref }}
+          ARMADA_VERSION: ${{ steps.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          source build_files/kpfe-video-encoding.env
+          buildah build --storage-opt=overlay.mount_program= \
+            --format docker --target chunkah --skip-unused-stages=false \
+            --security-opt label=disable --volume "$RUNNER_TEMP:/run/src" \
+            --build-arg "BASE_IMAGE=$KPFE_ENCODING_BASE_IMAGE" \
+            --build-arg "DTB_REF=$DTB_REF" \
+            --build-arg "ARMADA_VERSION=$ARMADA_VERSION" \
+            --build-arg "CHUNKAH_CONFIG_STR=$(jq -c . "$RUNNER_TEMP/evidence/runtime-config.json")" \
+            -f Containerfile.kpfe-video-encoding -t localhost/armada-kpfe-encoding-assembly .
+
+      - name: Validate the serialized bootc image
+        run: |
+          set -euo pipefail
+          for component in steam proton fex-rootfs; do
+            grep -Eq "creating tar layer .*\"xattr/$component\"" "$RUNNER_TEMP/chunkah.log"
+          done
+          skopeo inspect --raw "oci:$RUNNER_TEMP/chunked" > "$RUNNER_TEMP/evidence/manifest.json"
+          skopeo inspect --config "oci:$RUNNER_TEMP/chunked" > "$RUNNER_TEMP/evidence/config.json"
+          jq -e '(.layers | length) > 1 and (.layers | length) <= 128 and
+            ((.annotations // {}) | has("ostree.commit") | not) and
+            ((.annotations // {}) | has("ostree.final-diffid") | not)' "$RUNNER_TEMP/evidence/manifest.json"
+          jq -e --slurpfile expected "$RUNNER_TEMP/evidence/runtime-config.json" '
+            .config == $expected[0] and .architecture == "arm64" and .os == "linux" and
+            .config.Cmd == ["/sbin/init"] and
+            .config.Labels["containers.bootc"] == "1" and
+            .config.Labels["ostree.bootable"] == "true"' "$RUNNER_TEMP/evidence/config.json"
+          python3 build_files/verify-steam-bootstrap.py --oci "$RUNNER_TEMP/chunked"
+          cp "$RUNNER_TEMP/chunkah.log" "$RUNNER_TEMP/evidence/"
+
+      - name: Publish and sign the exact test digest
+        id: publish
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+          SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
+          VERSION: ${{ steps.prepare.outputs.version }}
+          DTB_INPUT_HASH: ${{ steps.prepare.outputs.dtb_input_hash }}
+          COSIGN_PASSWORD: ''
+        run: |
+          set -euo pipefail
+          source build_files/kpfe-video-encoding.env
+          test "$TEST_IMAGE" = ghcr.io/mrdidit/armada
+          test "$TEST_TAG" = test-kpfe-video-encoding-20261015
+          printf '%s' "$REGISTRY_TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          printf '%s' "$REGISTRY_TOKEN" | cosign login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          build_tag="build-$VERSION-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          skopeo copy --all "oci:$RUNNER_TEMP/chunked" "docker://$TEST_IMAGE:$build_tag"
+          digest=$(skopeo inspect --format '{{.Digest}}' "docker://$TEST_IMAGE:$build_tag")
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          umask 077
+          keydir=$(mktemp -d "$RUNNER_TEMP/kpfe-encoding-signing.XXXXXXXX")
+          trap 'rm -f -- "$keydir/original.pem" "$keydir/imported.key" "$keydir/imported.pub" "$keydir/imported.der"; rmdir "$keydir"' EXIT
+          printf '%s\n' "$SIGNING_SECRET" > "$keydir/original.pem"
+          unset SIGNING_SECRET
+          cosign import-key-pair --key "$keydir/original.pem" --output-key-prefix "$keydir/imported"
+          openssl pkey -pubin -in "$keydir/imported.pub" -outform DER > "$keydir/imported.der"
+          cmp "$keydir/imported.der" "$RUNNER_TEMP/expected-public.der"
+          cosign sign -y --new-bundle-format=false --key "$keydir/imported.key" "$TEST_IMAGE@$digest"
+          cosign verify --key build_files/kpfe-video-encoding-signing.pub "$TEST_IMAGE@$digest" > "$RUNNER_TEMP/evidence/signature.json"
+          jq -e --arg digest "$digest" --arg image "$TEST_IMAGE" 'any(.[];
+            .critical.image["docker-manifest-digest"] == $digest and
+            .critical.identity["docker-reference"] == $image)' "$RUNNER_TEMP/evidence/signature.json"
+          skopeo copy --all "docker://$TEST_IMAGE@$digest" "docker://$TEST_IMAGE:$TEST_TAG"
+          test "$(skopeo inspect --format '{{.Digest}}' "docker://$TEST_IMAGE:$TEST_TAG")" = "$digest"
+          jq -n --arg image "$TEST_IMAGE@$digest" --arg tag "$TEST_TAG" --arg build_tag "$build_tag" \
+            --arg base "$KPFE_ENCODING_BASE_IMAGE" --arg base_version "$KPFE_ENCODING_BASE_VERSION" \
+            --arg base_revision "$KPFE_ENCODING_BASE_REVISION" \
+            --arg firmware "$KPFE_ENCODING_FIRMWARE" --arg firmware_sha256 "$KPFE_ENCODING_FIRMWARE_SHA256" \
+            --arg revision "$GITHUB_SHA" --arg dtb_input_hash "$DTB_INPUT_HASH" \
+            '{image:$image, tag:$tag, build_tag:$build_tag, base:$base, base_version:$base_version,
+              base_revision:$base_revision, firmware:$firmware, firmware_sha256:$firmware_sha256,
+              revision:$revision, dtb_input_hash:$dtb_input_hash, kernel_unchanged:true, initramfs_unchanged:true,
+              hardware_tested:false}' > "$RUNNER_TEMP/evidence/build.json"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          {
+            printf '### KPFE video encoding signed test image\n\n'
+            printf 'Image: `%s@%s`\n\n' "$TEST_IMAGE" "$digest"
+            printf 'Test tag: `%s:%s`\n\n' "$TEST_IMAGE" "$TEST_TAG"
+            printf 'Base: `%s` (%s)\n\n' "$KPFE_ENCODING_BASE_IMAGE" "$KPFE_ENCODING_BASE_VERSION"
+            printf 'Build commit: `%s`\n\n' "$GITHUB_SHA"
+            printf 'Codec DTB, existing driver/firmware, udev rule, bootc lint and image checks passed; kernel and initramfs unchanged. Hardware testing is still required.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build provenance and validation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kpfe-encoding-build-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+          retention-days: 30
