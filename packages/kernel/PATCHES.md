@@ -421,7 +421,7 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0670-media-iris-subscribe-encoder-picture-type.patch`
   source: armada
   upstream: local
-  notes: Request encoder picture-type metadata through the existing HFI Gen2 subscription path. On a KPFE Linux 7.2.6 test image, all three IDRs and 87 P frames received the correct V4L2 flags while the encoded H.264 bytes matched the baseline. Combined with the force-keyframe backport, two short Steam recordings passed full video/audio decoding and timestamp checks; the user also reported several successful recordings. A later hard freeze outside active recording remains unexplained, so full stability is not claimed.
+  notes: Request encoder picture-type metadata through the existing HFI Gen2 subscription path. On a KPFE Linux 7.2.6 test image, all three IDRs and 87 P frames received the correct V4L2 flags while the encoded H.264 bytes matched the baseline. Combined with the force-keyframe backport, two short Steam recordings passed full video/audio decoding and timestamp checks; several additional recordings completed successfully. A later hard freeze outside active recording remains unexplained, so full stability is not claimed.
 - `patches/0671-media-iris-gen2-force-keyframe.patch`
   source: https://git.zx2c4.com/linux-rng/commit/?id=6f62dcefd2494aa9ac01538372353bf07755491e
   upstream: https://lore.kernel.org/all/20260723-dynamic_encode-v4-2-5fd6bd549ead@oss.qualcomm.com/

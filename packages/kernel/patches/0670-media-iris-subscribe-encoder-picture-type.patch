@@ -16,8 +16,8 @@ and 87 P frames but exported no KEYFRAME or PFRAME flags. The patched
 Linux 7.2.6 test image reported all 90 frame types correctly and produced
 byte-identical H.264 output. Steam recordings on that image, together
 with the force-keyframe backport, saved visible video and audio; both
-short clips passed complete decoding and timestamp checks. The user also
-reported several successful recordings. Overall stability remains under
+short clips passed complete decoding and timestamp checks. Several
+additional recordings completed successfully. Overall stability remains under
 investigation following a hard freeze with uncertain timing outside
 active recording.
 
