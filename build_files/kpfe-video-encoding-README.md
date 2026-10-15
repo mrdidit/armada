@@ -1,18 +1,19 @@
 # KPFE video encoding test
 
-Standalone test image for the KONKR Pocket Fit Elite. It enables the existing
-SM8750 Iris video codec and adds the encoder device path used by Steam.
+Standalone test image for the KONKR Pocket Fit Elite. It enables the SM8750
+Iris video codec and adds encoder compatibility fixes for Steam recording.
 
 The image uses official Armada testing `20261013.a30c39c` as its pinned base.
-It is independent of the separate suspend test. Only the KPFE device tree is
-compiled. The official kernel, modules, initramfs, Qualcomm firmware, Steam,
-Proton and FEX packages are retained.
+It is independent of the separate suspend test. The normal Armada kernel,
+modules and device trees are rebuilt with two Iris fixes, and a fresh initramfs
+is generated. Qualcomm firmware, Steam, Proton, FEX and the other installed
+packages stay at the pinned base versions.
 
 **Build KPFE video encoding test** is launched manually from
 `feat/kpfe-video-encoding-20261015` in `mrdidit/armada`.
-It compiles on native ARM64, checks that enabling Iris is the
-only device-tree change, verifies the existing encoder module and compressed
-firmware, and publishes a signed bootc image at:
+It compiles on native ARM64, checks the kernel configuration and the KPFE
+device-tree change, verifies module compatibility and compressed firmware,
+and publishes a signed bootc image at:
 
 `ghcr.io/mrdidit/armada:test-kpfe-video-encoding-20261015`
 
@@ -26,15 +27,18 @@ On this branch it calls
 the encoder test workflow and skips the normal package, image and disk builds.
 This does not require changing the default branch.
 
-Each run saves its source revision, DTB hashes, base digest, image digest,
-signatures and validation output in a `kpfe-encoding-build-evidence` artifact.
+Each run saves its source revision, kernel configuration, symbol versions,
+artifact hashes, base digest, image digest, signatures and validation output
+in a `kpfe-encoding-build-evidence` artifact.
 The workflow uses the existing fork `SIGNING_SECRET`; only its public key is
 stored here. A failed validation does not update the test tag.
 
-The DTB is a separate boot input: ostree includes it in the boot checksum,
-and Armada's boot image updater appends it to the kernel. The existing
-initramfs does not need regeneration for this change.
+The previous image exposed the hardware encoder successfully. A synthetic
+test produced 90 decodable frames, but the driver omitted the keyframe flags
+Steam needs to start a recording. This candidate adds picture-type reporting
+and the standard force-keyframe control. Recording and playback still need
+validation after the new kernel boots.
 
-This is a hardware test candidate. Firmware authentication, Steam hardware
-encoder selection and recording playback still need a test boot. No flashable
-disk is produced by this workflow.
+The complete kernel tree is replaced together, then the base image's dracut
+generates its initramfs. Armada's existing boot updater assembles the device
+boot image after deployment. No flashable disk is produced by this workflow.

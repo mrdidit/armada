@@ -1,23 +1,23 @@
-# Compile only the KPFE device tree; keep the official kernel and initramfs.
+# Replace only the kernel package and initramfs on the pinned official OS.
 ARG BASE_IMAGE=ghcr.io/armada-os/armada@sha256:7c2270888658e06e7419a4365b4224a46d81aec52c74c5d1f50b9cda7c066568
 ARG CHUNKAH_IMAGE=quay.io/coreos/chunkah@sha256:ff8b8b466a942ec6000445d4001fc661e2fc5a952ad9ee29b4de9ab09d1d1708
-ARG DTB_REF
+ARG KERNEL_REF
 
-FROM ${DTB_REF} AS dtb-artifact
+FROM ${KERNEL_REF} AS kernel-artifact
 
 FROM scratch AS ctx
-COPY build_files/52-configure-os-release.sh build_files/kpfe-video-encoding.env build_files/kpfe-video-encoding-overlay.sh /build_files/
+COPY build_files/52-configure-os-release.sh build_files/55-generate-initramfs.sh build_files/kpfe-video-encoding.env build_files/kpfe-video-encoding-overlay.sh /build_files/
 COPY system_files/usr/lib/udev/rules.d/70-armada-video-codec.rules /system_files/usr/lib/udev/rules.d/
 
 FROM ${BASE_IMAGE} AS armada-rootfs
 ARG BASE_IMAGE
-ARG DTB_REF
+ARG KERNEL_REF
 ARG ARMADA_VERSION
 LABEL org.opencontainers.image.version="${ARMADA_VERSION}"
 
 RUN --network=none \
     --mount=type=bind,from=ctx,source=/,target=/ctx \
-    --mount=type=bind,from=dtb-artifact,source=/dtb,target=/dtb \
+    --mount=type=bind,from=kernel-artifact,source=/kernel,target=/kernel \
     --mount=type=tmpfs,dst=/tmp \
     /bin/bash /ctx/build_files/kpfe-video-encoding-overlay.sh
 

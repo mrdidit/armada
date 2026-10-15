@@ -97,7 +97,7 @@ jobs:
             .Labels["org.opencontainers.image.version"] = $version |
             .Labels["org.opencontainers.image.revision"] = $revision |
             .Labels["org.opencontainers.image.created"] = (now | todateiso8601) |
-            .Labels["org.opencontainers.image.description"] = "Armada testing with KPFE Iris video codec enabled" |
+            .Labels["org.opencontainers.image.description"] = "Armada testing with KPFE Iris encoder keyframe fixes" |
             .Labels["org.opencontainers.image.source"] = ("https://github.com/mrdidit/armada/tree/" + $revision) |
             .Labels["org.opencontainers.image.base.name"] = $base |
             .Labels["org.opencontainers.image.base.digest"] = ($base | split("@")[1]) |
@@ -105,51 +105,60 @@ jobs:
             del(.Labels["ostree.commit"], .Labels["ostree.final-diffid"])' \
             "$RUNNER_TEMP/evidence/base-config.json" > "$RUNNER_TEMP/evidence/runtime-config.json"
           hash=$( { packages/package-hash.sh kernel;
-            sha256sum Containerfile.kpfe-video-encoding-dtb build_files/kpfe-video-encoding-dtb.sh \
+            sha256sum Containerfile.kpfe-video-encoding-kernel build_files/kpfe-video-encoding-kernel.sh \
               build_files/kpfe-video-encoding.env; } | sha256sum | cut -c1-32)
-          echo "dtb_ref=localhost/armada-kpfe-encoding-dtb:$hash" >> "$GITHUB_OUTPUT"
-          echo "dtb_input_hash=$hash" >> "$GITHUB_OUTPUT"
+          echo "kernel_ref=localhost/armada-kpfe-encoding-kernel:$hash" >> "$GITHUB_OUTPUT"
+          echo "kernel_input_hash=$hash" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           cp build_files/kpfe-video-encoding.env build_files/kpfe-video-encoding-signing.pub "$RUNNER_TEMP/evidence/"
 
-      - name: Compile only the KPFE device tree
+      - name: Compile the kernel with Iris encoder fixes
         env:
-          DTB_REF: ${{ steps.prepare.outputs.dtb_ref }}
+          KERNEL_REF: ${{ steps.prepare.outputs.kernel_ref }}
         run: |
           set -euo pipefail
           source packages/toolchain.env
           sha256sum packages/kernel/dts/sm8750-konkr-pf-elite.dts.patch \
+            packages/kernel/patches/0670-media-iris-subscribe-encoder-picture-type.patch \
+            packages/kernel/patches/0671-media-iris-gen2-force-keyframe.patch \
             system_files/usr/lib/udev/rules.d/70-armada-video-codec.rules \
             > "$RUNNER_TEMP/evidence/codec-inputs.sha256"
-          # The image context excludes packages/. Stage only the DTB inputs
-          # without changing those normal image-build exclusions.
-          dtb_context="$RUNNER_TEMP/kpfe-dtb-context"
-          mkdir -p "$dtb_context/packages" "$dtb_context/build_files"
-          cp -a packages/kernel "$dtb_context/packages/"
-          cp build_files/kpfe-video-encoding.env build_files/kpfe-video-encoding-dtb.sh \
-            "$dtb_context/build_files/"
-          cp Containerfile.kpfe-video-encoding-dtb "$dtb_context/"
+          kernel_context="$RUNNER_TEMP/kpfe-kernel-context"
+          mkdir -p "$kernel_context/packages" "$kernel_context/build_files"
+          cp -a packages/kernel "$kernel_context/packages/"
+          cp build_files/kpfe-video-encoding.env build_files/kpfe-video-encoding-kernel.sh \
+            "$kernel_context/build_files/"
+          cp Containerfile.kpfe-video-encoding-kernel "$kernel_context/"
           buildah build --storage-opt=overlay.mount_program= \
-            -f "$dtb_context/Containerfile.kpfe-video-encoding-dtb" --target out-dtb --layers \
+            -f "$kernel_context/Containerfile.kpfe-video-encoding-kernel" --target out-kernel --layers \
             --build-arg "BUILDER_IMAGE=$BUILDER_IMAGE" \
-            -t "$DTB_REF" "$dtb_context" 2>&1 | tee "$RUNNER_TEMP/evidence/dtb-build.log"
+            -t "$KERNEL_REF" "$kernel_context" 2>&1 | tee "$RUNNER_TEMP/evidence/kernel-build.log"
 
-      - name: Verify only the Iris status changes in the compiled device tree
+      - name: Verify kernel provenance and the KPFE device tree
         env:
-          DTB_REF: ${{ steps.prepare.outputs.dtb_ref }}
+          KERNEL_REF: ${{ steps.prepare.outputs.kernel_ref }}
         run: |
           set -euo pipefail
           source build_files/kpfe-video-encoding.env
           export KPFE_ENCODING_BASE_IMAGE KPFE_ENCODING_KERNEL_VERSION
-          buildah unshare bash <<'EXTRACT_DTB'
+          buildah unshare bash <<'EXTRACT_KERNEL'
           set -euo pipefail
           containers=()
           cleanup() { for c in "${containers[@]}"; do buildah rm "$c" >/dev/null; done; }
           trap cleanup EXIT
-          container=$(buildah from "$DTB_REF")
+          container=$(buildah from "$KERNEL_REF")
           containers+=("$container")
           root=$(buildah mount "$container")
-          cp "$root"/dtb/* "$RUNNER_TEMP/evidence/"
+          (cd "$root/kernel" && sha256sum -c SHA256SUMS)
+          cp "$root/kernel/kernel-build.config" "$root/kernel/kernel-source.txt" \
+            "$root/kernel/Module.symvers" "$RUNNER_TEMP/evidence/"
+          cp "$root/kernel/SHA256SUMS" "$RUNNER_TEMP/evidence/kernel-artifact-SHA256SUMS"
+          mkdir -p "$RUNNER_TEMP/candidate-kernel"
+          tar --zstd -xf "$root/kernel/armada-kernel-$KPFE_ENCODING_KERNEL_VERSION.tar.zst" \
+            -C "$RUNNER_TEMP/candidate-kernel"
+          candidate="$RUNNER_TEMP/candidate-kernel/lib/modules/$KPFE_ENCODING_KERNEL_VERSION"
+          cp "$candidate/dtb/qcom/sm8750-konkr-pf-elite.dtb" "$RUNNER_TEMP/evidence/"
+          cp "$candidate/.armada-source" "$RUNNER_TEMP/evidence/candidate-kernel-source.txt"
           container=$(buildah from "$KPFE_ENCODING_BASE_IMAGE")
           containers+=("$container")
           root=$(buildah mount "$container")
@@ -157,8 +166,7 @@ jobs:
             "$RUNNER_TEMP/evidence/base-kpfe.dtb"
           cp "$root/usr/lib/modules/$KPFE_ENCODING_KERNEL_VERSION/.armada-source" \
             "$RUNNER_TEMP/evidence/base-kernel-source.txt"
-          EXTRACT_DTB
-          (cd "$RUNNER_TEMP/evidence" && sha256sum -c SHA256SUMS)
+          EXTRACT_KERNEL
           dtb="$RUNNER_TEMP/evidence/sm8750-konkr-pf-elite.dtb"
           base_dtb="$RUNNER_TEMP/evidence/base-kpfe.dtb"
           node=/soc@0/video-codec@aa00000
@@ -176,15 +184,16 @@ jobs:
           dtc -q -s -I dtb -O dts "$dtb" > "$RUNNER_TEMP/evidence/kpfe-codec.dts"
           cmp "$RUNNER_TEMP/compare-kpfe.dts" "$RUNNER_TEMP/evidence/kpfe-codec.dts"
           dtc -q -s -I dtb -O dts "$base_dtb" > "$RUNNER_TEMP/evidence/base-kpfe.dts"
-          for source_file in dtb-source.txt base-kernel-source.txt; do
-            grep -Fx "Patches applied: $KPFE_ENCODING_PATCH_COUNT (from patches/series)" \
-              "$RUNNER_TEMP/evidence/$source_file"
-          done
+          grep -Fx "Patches applied: $KPFE_ENCODING_BASE_PATCH_COUNT (from patches/series)" \
+            "$RUNNER_TEMP/evidence/base-kernel-source.txt"
+          grep -Fx "Patches applied: $KPFE_ENCODING_PATCH_COUNT (from patches/series)" \
+            "$RUNNER_TEMP/evidence/candidate-kernel-source.txt"
+          grep -Fx 'CONFIG_VIDEO_QCOM_IRIS=m' "$RUNNER_TEMP/evidence/kernel-build.config"
           sha256sum "$dtb" "$base_dtb" > "$RUNNER_TEMP/evidence/codec-artifacts.sha256"
 
-      - name: Assemble and rechunk the DTB update
+      - name: Assemble the kernel update and regenerate initramfs
         env:
-          DTB_REF: ${{ steps.prepare.outputs.dtb_ref }}
+          KERNEL_REF: ${{ steps.prepare.outputs.kernel_ref }}
           ARMADA_VERSION: ${{ steps.prepare.outputs.version }}
         run: |
           set -euo pipefail
@@ -193,7 +202,7 @@ jobs:
             --format docker --target chunkah --skip-unused-stages=false \
             --security-opt label=disable --volume "$RUNNER_TEMP:/run/src" \
             --build-arg "BASE_IMAGE=$KPFE_ENCODING_BASE_IMAGE" \
-            --build-arg "DTB_REF=$DTB_REF" \
+            --build-arg "KERNEL_REF=$KERNEL_REF" \
             --build-arg "ARMADA_VERSION=$ARMADA_VERSION" \
             --build-arg "CHUNKAH_CONFIG_STR=$(jq -c . "$RUNNER_TEMP/evidence/runtime-config.json")" \
             -f Containerfile.kpfe-video-encoding -t localhost/armada-kpfe-encoding-assembly .
@@ -223,7 +232,7 @@ jobs:
           REGISTRY_TOKEN: ${{ github.token }}
           SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
           VERSION: ${{ steps.prepare.outputs.version }}
-          DTB_INPUT_HASH: ${{ steps.prepare.outputs.dtb_input_hash }}
+          KERNEL_INPUT_HASH: ${{ steps.prepare.outputs.kernel_input_hash }}
           COSIGN_PASSWORD: ''
         run: |
           set -euo pipefail
@@ -255,10 +264,10 @@ jobs:
             --arg base "$KPFE_ENCODING_BASE_IMAGE" --arg base_version "$KPFE_ENCODING_BASE_VERSION" \
             --arg base_revision "$KPFE_ENCODING_BASE_REVISION" \
             --arg firmware "$KPFE_ENCODING_FIRMWARE" --arg firmware_sha256 "$KPFE_ENCODING_FIRMWARE_SHA256" \
-            --arg revision "$GITHUB_SHA" --arg dtb_input_hash "$DTB_INPUT_HASH" \
+            --arg revision "$GITHUB_SHA" --arg kernel_input_hash "$KERNEL_INPUT_HASH" \
             '{image:$image, tag:$tag, build_tag:$build_tag, base:$base, base_version:$base_version,
               base_revision:$base_revision, firmware:$firmware, firmware_sha256:$firmware_sha256,
-              revision:$revision, dtb_input_hash:$dtb_input_hash, kernel_unchanged:true, initramfs_unchanged:true,
+              revision:$revision, kernel_input_hash:$kernel_input_hash, kernel_unchanged:false, initramfs_unchanged:false,
               hardware_tested:false}' > "$RUNNER_TEMP/evidence/build.json"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           {
@@ -267,7 +276,7 @@ jobs:
             printf 'Test tag: `%s:%s`\n\n' "$TEST_IMAGE" "$TEST_TAG"
             printf 'Base: `%s` (%s)\n\n' "$KPFE_ENCODING_BASE_IMAGE" "$KPFE_ENCODING_BASE_VERSION"
             printf 'Build commit: `%s`\n\n' "$GITHUB_SHA"
-            printf 'Codec DTB, existing driver/firmware, udev rule, bootc lint and image checks passed; kernel and initramfs unchanged. Hardware testing is still required.\n'
+            printf 'Patched Iris kernel, codec DTB, regenerated initramfs, unchanged firmware and RPMs, bootc lint and image checks passed. Hardware testing of this build is still required.\n'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload build provenance and validation evidence

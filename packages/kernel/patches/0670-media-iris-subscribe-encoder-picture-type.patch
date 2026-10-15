@@ -1,0 +1,47 @@
+Subject: [PATCH] media: iris: Subscribe to encoder output picture type
+
+The Gen2 response handler uses HFI_PROP_PICTURE_TYPE to assign the V4L2
+KEYFRAME, PFRAME and BFRAME buffer flags. Encoder sessions currently skip
+all property subscriptions, although consumers need these flags to
+recognize an independently decodable start to the stream.
+
+Request picture-type metadata for the encoder bitstream port through the
+existing subscription path. Leave raw-input and decoder subscriptions
+unchanged. The working Frame vendor driver independently subscribes to
+the same property on its encoder output port.
+
+On KPFE, a 90-frame H.264 hardware encode contains three IDR frames and
+87 non-IDR frames, decodes cleanly, and exports no KEYFRAME flags on any
+capture buffer. This omission prevents consumers waiting for a marked
+keyframe from starting video. Validate the firmware response and exported
+flags on the patched build before declaring recording fixed.
+
+---
+--- a/drivers/media/platform/qcom/iris/iris_hfi_gen2_command.c
++++ b/drivers/media/platform/qcom/iris/iris_hfi_gen2_command.c
+@@ -1052,6 +1052,7 @@
+ 
+ static int iris_hfi_gen2_subscribe_property(struct iris_inst *inst, u32 plane)
+ {
++	static const u32 enc_output_properties[] = { HFI_PROP_PICTURE_TYPE };
+ 	struct iris_core *core = inst->core;
+ 	u32 subscribe_prop_size = 0, i;
+ 	const u32 *subcribe_prop = NULL;
+@@ -1059,10 +1060,13 @@
+ 
+ 	payload[0] = HFI_MODE_PROPERTY;
+ 
+-	if (inst->domain == ENCODER)
+-		return 0;
+-
+-	if (V4L2_TYPE_IS_OUTPUT(plane)) {
++	if (inst->domain == ENCODER) {
++		if (V4L2_TYPE_IS_OUTPUT(plane))
++			return 0;
++
++		subcribe_prop = enc_output_properties;
++		subscribe_prop_size = ARRAY_SIZE(enc_output_properties);
++	} else if (V4L2_TYPE_IS_OUTPUT(plane)) {
+ 		subscribe_prop_size = core->iris_firmware_data->dec_input_prop_size;
+ 		subcribe_prop = core->iris_firmware_data->dec_input_prop;
+ 	} else {

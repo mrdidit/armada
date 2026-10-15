@@ -823,3 +823,12 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0505a-arm64-unaligned-atomics-cover-the-load128-store-exclusive.patch`
   source: armada
   upstream: local
+
+- `patches/0670-media-iris-subscribe-encoder-picture-type.patch`
+  source: armada
+  upstream: local
+  notes: Request encoder picture-type metadata through the existing HFI Gen2 subscription path. KPFE's baseline produces valid IDR frames without V4L2 KEYFRAME flags. The working Frame vendor driver requests the same metadata. Patched hardware recording remains under test.
+- `patches/0671-media-iris-gen2-force-keyframe.patch`
+  source: https://git.zx2c4.com/linux-rng/commit/?id=6f62dcefd2494aa9ac01538372353bf07755491e
+  upstream: https://lore.kernel.org/all/20260723-dynamic_encode-v4-2-5fd6bd549ead@oss.qualcomm.com/
+  notes: Backport the five HFI Gen2/shared-control files to 7.2.6, preserving upstream authorship and behavior; omit the three Gen1-only changes. Adds the standard force-keyframe control rejected by the KPFE baseline.

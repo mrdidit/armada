@@ -1,0 +1,12 @@
+# Build the normal complete kernel package, with verified source and evidence.
+ARG BUILDER_IMAGE=registry.fedoraproject.org/fedora@sha256:0c6072366ebf8ea1c8c0f3a118aad3e9a9247d3065d499e54d62968f69351966
+
+FROM ${BUILDER_IMAGE} AS kernel-builder
+COPY packages/kernel/ /work/
+COPY build_files/kpfe-video-encoding.env build_files/kpfe-video-encoding-kernel.sh /src/
+WORKDIR /work
+RUN --mount=type=cache,id=armada-ccache-kernel,target=/ccache \
+    /bin/bash /src/kpfe-video-encoding-kernel.sh
+
+FROM scratch AS out-kernel
+COPY --from=kernel-builder /work/out/ /kernel/
