@@ -8,13 +8,23 @@ It is independent of the separate suspend test. Only the KPFE device tree is
 compiled. The official kernel, modules, initramfs, Qualcomm firmware, Steam,
 Proton and FEX packages are retained.
 
-**Build KPFE video encoding test** runs for pushes to
-`feat/kpfe-video-encoding-20261015` in `mrdidit/armada`, or by manual dispatch
-from that branch. It compiles on native ARM64, checks that enabling Iris is the
+**Build KPFE video encoding test** is launched manually from
+`feat/kpfe-video-encoding-20261015` in `mrdidit/armada`.
+It compiles on native ARM64, checks that enabling Iris is the
 only device-tree change, verifies the existing encoder module and compressed
 firmware, and publishes a signed bootc image at:
 
 `ghcr.io/mrdidit/armada:test-kpfe-video-encoding-20261015`
+
+Dispatch the existing `build.yml` workflow with this feature branch selected:
+
+```sh
+gh workflow run build.yml --repo mrdidit/armada --ref feat/kpfe-video-encoding-20261015
+```
+
+On this branch it calls
+the encoder test workflow and skips the normal package, image and disk builds.
+This does not require changing the default branch.
 
 Each run saves its source revision, DTB hashes, base digest, image digest,
 signatures and validation output in a `kpfe-encoding-build-evidence` artifact.

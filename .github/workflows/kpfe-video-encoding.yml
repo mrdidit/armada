@@ -2,10 +2,11 @@
 name: Build KPFE video encoding test
 
 on:
-  push:
-    branches:
-      - feat/kpfe-video-encoding-20261015
   workflow_dispatch:
+  workflow_call:
+    secrets:
+      SIGNING_SECRET:
+        required: true
 
 permissions: {}
 

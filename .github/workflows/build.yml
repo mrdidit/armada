@@ -21,8 +21,19 @@ concurrency:
   queue: max
 
 jobs:
+  kpfe_video_encoding:
+    name: KPFE video encoding test
+    if: github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/feat/kpfe-video-encoding-20261015'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/kpfe-video-encoding.yml
+    secrets:
+      SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
+
   packages:
     name: Packages
+    if: github.repository != 'mrdidit/armada' || github.ref != 'refs/heads/feat/kpfe-video-encoding-20261015'
     permissions:
       contents: read
       packages: write
