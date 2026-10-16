@@ -8,8 +8,12 @@ be registered for dispatch.
 
 The publisher accepts only a successful, completed `armada-os/armada` PR
 workflow run for `mrdidit/armada:feat/kpfe-steam-recording`. The PR must remain
-open with the specified head and synthetic merge. Their Git trees must match
-the expected tree. The image revision must identify that exact merge commit.
+open on the specified fork branch. The original build head and synthetic
+merge must have the expected Git tree. A rewritten current head is accepted
+only after fetching that exact commit and verifying the same tree, with the
+original merge base unchanged. This does not relabel the artifact: run,
+attempt, build head, merge, image revision and tag remain pinned to the
+original successful build.
 
 The artifact must be `armada-container-pr737`, with the supplied immutable
 artifact ID and ZIP SHA256. Its creation timestamp must fall within the
@@ -72,8 +76,8 @@ Dispatch the already registered workflow at this dedicated branch:
 gh api --method POST repos/mrdidit/armada/actions/workflows/build.yml/dispatches --input publisher-dispatch.json
 ```
 
-The selected run and current PR metadata are checked again after download,
-before handing the inspected archive to the publishing step.
+The selected run and current PR metadata are checked again after download and
+module inspection, before handing the archive to the publishing step.
 
 ## Publication and recovery
 
@@ -96,7 +100,18 @@ material is temporary and is not included in logs or evidence artifacts.
 
 The evidence artifact records upstream run, attempt, upload job, source
 head/merge/tree, artifact ZIP hash, image manifest/config, immutable image
-digest and verified signature. `image_pushed` is recorded before signing;
+digest and verified signature. Current PR head evidence is recorded separately
+from the original build provenance.
+
+`iris-module.json` records the installed `qcom-iris.ko`, `.ko.xz` or `.ko.zst`
+file checksum directly from the pinned OCI archive. The reader verifies every
+layer blob and uncompressed content digest, applies relevant OCI whiteouts,
+and hashes the final stored module bytes. It does not execute the image,
+extract its filesystem or use a checksum observed on the device. Raw and gzip
+layers are supported; unsupported compression, ambiguous aliases, relevant
+links and malformed layers stop publication without accepting a module hash.
+
+`image_pushed` is recorded before signing;
 `published` becomes true only after signature verification. A completed
 publication still requires boot and recording/playback validation on hardware.
 
@@ -104,6 +119,7 @@ publication still requires boot and recording/playback validation on hardware.
 
 ```sh
 python3 .github/scripts/test-pr737-publisher.py
+python3 .github/scripts/test-hash-iris-oci-module.py
 bash -n .github/scripts/publish-pr737-artifact.sh
 git diff --check
 ```
@@ -111,4 +127,6 @@ git diff --check
 The offline tests cover source substitution, failed or different attempts,
 artifact replacement, ZIP traversal/symlinks, incompatible image metadata,
 registry failure, conflicting tags, signing failure and exact-digest recovery.
+They also cover same-tree history rewrites without provenance substitution,
+changes during inspection, module evidence generation and OCI layer handling.
 They do not prove live token access or execute an image publication.

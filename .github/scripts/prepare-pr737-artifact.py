@@ -56,7 +56,14 @@ def api(path):
                          "must be available.") from exc
 
 
-def validate_metadata(values, run, attempt, workflow, pr, head, merge, artifact, jobs):
+def current_head_commit(pr, original_head):
+    sha = pr.get("head", {}).get("sha", "")
+    require(re.fullmatch(r"[0-9a-f]{40}", sha), "Invalid current PR head")
+    return original_head if sha == original_head.get("sha") else api(f"git/commits/{sha}")
+
+
+def validate_metadata(values, run, attempt, workflow, pr, head, merge, artifact, jobs,
+                      current_head=None):
     for item in (run, attempt):
         require(item.get("id") == values["run_id"], "Run ID mismatch")
         require(item.get("run_attempt") == values["run_attempt"], "Run attempt changed")
@@ -75,11 +82,16 @@ def validate_metadata(values, run, attempt, workflow, pr, head, merge, artifact,
             and workflow.get("path") == ".github/workflows/pr.yml", "Workflow ID mismatch")
     require(pr.get("number") == 737 and pr.get("state") == "open", "PR 737 is not open")
     require(pr.get("head", {}).get("repo", {}).get("full_name") == FORK
-            and pr["head"].get("ref") == BRANCH
-            and pr["head"].get("sha") == values["head_sha"], "PR head changed")
+            and pr["head"].get("ref") == BRANCH, "Unexpected current PR head repository or branch")
+    current_head = head if current_head is None else current_head
+    require(re.fullmatch(r"[0-9a-f]{40}", pr["head"].get("sha", ""))
+            and current_head.get("sha") == pr["head"]["sha"]
+            and current_head.get("tree", {}).get("sha") == values["tree_sha"],
+            "Current PR head does not have the verified original tree")
     require(pr.get("base", {}).get("repo", {}).get("full_name") == UPSTREAM
             and pr["base"].get("ref") == "main", "Unexpected PR base")
-    require(pr.get("merge_commit_sha") == values["merge_sha"], "PR merge commit changed")
+    if pr["head"]["sha"] == values["head_sha"]:
+        require(pr.get("merge_commit_sha") == values["merge_sha"], "PR merge commit changed")
     require(head.get("sha") == values["head_sha"]
             and head.get("tree", {}).get("sha") == values["tree_sha"], "Head tree mismatch")
     require(merge.get("sha") == values["merge_sha"]
@@ -172,6 +184,14 @@ def write_json(path, data):
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
+def record_iris_module(archive, digest, revision, evidence):
+    report = evidence / "iris-module.json"
+    command([sys.executable, str(Path(__file__).with_name("hash-iris-oci-module.py")),
+             str(archive), "--manifest-digest", digest, "--revision", revision,
+             "--output", str(report)])
+    return json.loads(report.read_text())
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -188,13 +208,15 @@ def main():
     workflow = api(f"actions/workflows/{workflow_id}")
     pr = api("pulls/737")
     head = api(f"git/commits/{values['head_sha']}")
+    current_head = current_head_commit(pr, head)
     merge = api(f"git/commits/{values['merge_sha']}")
     artifact = api(f"actions/artifacts/{values['artifact_id']}")
     jobs = api(f"actions/runs/{values['run_id']}/attempts/{values['run_attempt']}/jobs?per_page=100")
-    validate_metadata(values, run, attempt, workflow, pr, head, merge, artifact, jobs)
+    validate_metadata(values, run, attempt, workflow, pr, head, merge, artifact, jobs,
+                      current_head)
     for name, data in (("run", run), ("attempt", attempt), ("workflow", workflow),
                        ("pr", pr), ("head", head), ("merge", merge), ("artifact", artifact),
-                       ("jobs", jobs)):
+                       ("jobs", jobs), ("current-head", current_head)):
         write_json(evidence / f"upstream-{name}.json", data)
     require(shutil.disk_usage(output).free > artifact["size_in_bytes"] + 1024**3,
             "Insufficient disk space for artifact download")
@@ -212,18 +234,29 @@ def main():
     validate_oci(values, config, manifest)
     digest = command(["skopeo", "inspect", "--format", "{{.Digest}}", reference]).decode().strip()
     require(re.fullmatch(r"sha256:[0-9a-f]{64}", digest), "Invalid OCI manifest digest")
-    # Detect a newer attempt or source update that arrived during the download.
-    validate_metadata(values, api(f"actions/runs/{values['run_id']}"), attempt, workflow,
-                      api("pulls/737"), head, merge, artifact, jobs)
+    write_json(evidence / "image-config.json", config)
+    write_json(evidence / "image-manifest.json", manifest)
+    module = record_iris_module(archive, digest, values["merge_sha"], evidence)
+    # Detect a newer attempt or source update during download/module inspection.
+    final_run = api(f"actions/runs/{values['run_id']}")
+    final_pr = api("pulls/737")
+    final_head = current_head_commit(final_pr, head)
+    validate_metadata(values, final_run, attempt, workflow, final_pr, head, merge,
+                      artifact, jobs, final_head)
+    for name, data in (("run", final_run), ("pr", final_pr), ("current-head", final_head)):
+        write_json(evidence / f"upstream-final-{name}.json", data)
     tag = f"pr737-build-{values['run_id']}-{values['run_attempt']}-{values['head_sha'][:7]}"
     provenance = {**values, "upstream_repository": UPSTREAM, "image_repository": IMAGE,
                   "image_tag": tag, "image": f"{IMAGE}@{digest}", "manifest_digest": digest,
                   "oci_archive": str(archive), "source_tree_verified": True,
                   "upstream_run_conclusion": "success", "published": False,
+                  "current_pr": {"head_sha": final_head["sha"],
+                                 "tree_sha": final_head["tree"]["sha"],
+                                 "merge_commit_sha": final_pr.get("merge_commit_sha"),
+                                 "head_matches_build": final_head["sha"] == values["head_sha"]},
+                  "iris_module": module["module"],
                   "publisher_commit": os.environ.get("GITHUB_SHA"),
                   "publisher_run": os.environ.get("GITHUB_RUN_ID")}
-    write_json(evidence / "image-config.json", config)
-    write_json(evidence / "image-manifest.json", manifest)
     write_json(evidence / "publication.json", provenance)
     print(f"Verified OCI image {digest}; ready to publish unique tag {tag}", flush=True)
 

@@ -18,6 +18,9 @@ HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("prepare", HERE / "prepare-pr737-artifact.py")
 prepare = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(prepare)
+spec = importlib.util.spec_from_file_location("oci_fixture", HERE / "test-hash-iris-oci-module.py")
+oci_fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(oci_fixture)
 
 
 def fixture():
@@ -52,6 +55,51 @@ def fixture():
 class ProvenanceTests(unittest.TestCase):
     def test_exact_successful_source_passes(self):
         prepare.validate_metadata(*fixture())
+
+    def test_rewritten_current_head_requires_the_original_tree(self):
+        args = fixture()
+        args[4]["head"]["sha"] = "f" * 40
+        args[4]["merge_commit_sha"] = "1" * 40
+        current = {"sha": "f" * 40, "tree": {"sha": args[0]["tree_sha"]}}
+        prepare.validate_metadata(*args, current)
+        for invalid in (None, {"sha": "2" * 40, "tree": current["tree"]},
+                        {"sha": current["sha"], "tree": {"sha": "2" * 40}}):
+            with self.subTest(current=invalid), self.assertRaises(ValueError):
+                prepare.validate_metadata(*args, invalid)
+
+    def test_rewritten_head_does_not_relax_original_artifact_provenance(self):
+        for index, path, value in (
+                (1, ("head_sha",), "f" * 40), (1, ("run_attempt",), 3),
+                (1, ("conclusion",), "failure"), (2, ("run_attempt",), 3),
+                (4, ("base", "sha"), "1" * 40),
+                (5, ("sha",), "f" * 40), (5, ("tree", "sha"), "1" * 40),
+                (6, ("sha",), "1" * 40), (6, ("tree", "sha"), "1" * 40),
+                (7, ("id",), 999), (7, ("workflow_run", "head_sha"), "f" * 40),
+                (7, ("digest",), "sha256:" + "1" * 64),
+                (7, ("created_at",), "2026-10-15T20:20:00Z")):
+            with self.subTest(index=index, path=path):
+                args = fixture()
+                args[4]["head"]["sha"] = "f" * 40
+                args[4]["merge_commit_sha"] = "1" * 40
+                current = {"sha": "f" * 40, "tree": {"sha": args[0]["tree_sha"]}}
+                target = args[index]
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                with self.assertRaises(ValueError):
+                    prepare.validate_metadata(*args, current)
+
+    def test_current_commit_is_fetched_by_its_exact_validated_sha(self):
+        args = fixture()
+        with mock.patch.object(prepare, "api") as api:
+            self.assertEqual(prepare.current_head_commit(args[4], args[5]), args[5])
+            api.assert_not_called()
+            args[4]["head"]["sha"] = "f" * 40
+            prepare.current_head_commit(args[4], args[5])
+            api.assert_called_once_with("git/commits/" + "f" * 40)
+            args[4]["head"]["sha"] = "../../unrelated"
+            with self.assertRaises(ValueError):
+                prepare.current_head_commit(args[4], args[5])
 
     def test_metadata_substitution_and_failed_runs_are_rejected(self):
         mutations = [
@@ -159,6 +207,103 @@ class ImageTests(unittest.TestCase):
                 target[path[-1]] = value
                 with self.assertRaises(ValueError):
                     prepare.validate_oci(fixture()[0], *args)
+
+
+class PreparationTests(unittest.TestCase):
+    def simulate(self, *, final_tree_changed=False, corrupt_module=False):
+        args = fixture()
+        values, run, attempt, workflow, pr, head, merge, artifact, jobs = args
+        pr["head"]["sha"] = "f" * 40
+        pr["merge_commit_sha"] = "1" * 40
+        current = {"sha": "f" * 40, "tree": {"sha": values["tree_sha"]}}
+        metadata = {"actions/runs/123": run, "actions/runs/123/attempts/2": attempt,
+                    "actions/workflows/789": workflow, "pulls/737": pr,
+                    "git/commits/" + values["head_sha"]: head,
+                    "git/commits/" + values["merge_sha"]: merge,
+                    "git/commits/" + current["sha"]: current,
+                    "actions/artifacts/456": artifact,
+                    "actions/runs/123/attempts/2/jobs?per_page=100": jobs}
+        current_reads = 0
+        def api(path):
+            nonlocal current_reads
+            result = copy.deepcopy(metadata[path])
+            if path == "git/commits/" + current["sha"]:
+                current_reads += 1
+                if final_tree_changed and current_reads == 2:
+                    result["tree"]["sha"] = "2" * 40
+            return result
+
+        actual_command, actual_run = prepare.command, subprocess.run
+        def run_command(command, **kwargs):
+            if command[:2] == ["gh", "api"]:
+                self.assertEqual(command[2], "repos/armada-os/armada/actions/artifacts/456/zip")
+                kwargs["stdout"].write(b"fake ZIP; extraction mocked below")
+                return subprocess.CompletedProcess(command, 0)
+            return actual_run(command, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / prepare.ARCHIVE_NAME
+            with mock.patch.object(oci_fixture, "REVISION", values["merge_sha"]):
+                digest = oci_fixture.make_archive(archive,
+                    [[(oci_fixture.MODULE + ".xz", b"original module bytes")]],
+                    compressed=True, corrupt=corrupt_module)
+            config, manifest = ImageTests().fixture()
+            def command(command):
+                if command[:2] == ["skopeo", "inspect"]:
+                    if command[2] == "--config":
+                        return json.dumps(config).encode()
+                    if command[2] == "--raw":
+                        return json.dumps(manifest).encode()
+                    return digest.encode()
+                return actual_command(command)
+
+            output = root / "prepared"
+            env = {"PR737_" + key.upper(): str(value) for key, value in values.items()}
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(prepare.sys, "argv", ["prepare", "--output", str(output)]), \
+                    mock.patch.object(prepare, "api", side_effect=api), \
+                    mock.patch.object(prepare, "command", side_effect=command), \
+                    mock.patch.object(prepare.subprocess, "run", side_effect=run_command), \
+                    mock.patch.object(prepare, "verify_zip", return_value=archive):
+                if final_tree_changed:
+                    with self.assertRaisesRegex(ValueError, "Current PR head"):
+                        prepare.main()
+                elif corrupt_module:
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        prepare.main()
+                else:
+                    prepare.main()
+            evidence = output / "evidence"
+            return {path.name: json.loads(path.read_text()) for path in evidence.glob("*.json")}
+
+    def test_module_evidence_and_rewritten_head_keep_original_image_provenance(self):
+        files = self.simulate()
+        result = files["publication.json"]
+        original = fixture()[0]
+        for key, value in original.items():
+            self.assertEqual(result[key], value)
+        self.assertEqual(result["image_tag"], "pr737-build-123-2-aaaaaaa")
+        self.assertEqual(result["current_pr"]["head_sha"], "f" * 40)
+        self.assertFalse(result["current_pr"]["head_matches_build"])
+        module = files["iris-module.json"]
+        self.assertEqual(module["manifest_digest"], result["manifest_digest"])
+        self.assertEqual(module["image_revision"], original["merge_sha"])
+        self.assertEqual(module["module"], result["iris_module"])
+        self.assertEqual(module["module"]["sha256"], hashlib.sha256(b"original module bytes").hexdigest())
+        self.assertFalse(module["device_observation_used"])
+        self.assertIn("upstream-final-current-head.json", files)
+
+    def test_source_tree_change_during_inspection_stops_before_publication(self):
+        files = self.simulate(final_tree_changed=True)
+        self.assertIn("iris-module.json", files)
+        self.assertNotIn("publication.json", files)
+
+    def test_invalid_module_archive_stops_before_publication(self):
+        files = self.simulate(corrupt_module=True)
+        self.assertNotIn("iris-module.json", files)
+        self.assertNotIn("publication.json", files)
+        self.assertIn("image-manifest.json", files)
 
 
 class PublicationTests(unittest.TestCase):
