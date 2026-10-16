@@ -147,7 +147,7 @@ class ModuleHashTests(unittest.TestCase):
             def verify_blob(self, unused):
                 return "unused"
         with self.assertRaisesRegex(ValueError, "Unsupported layer media type"):
-            MOD.inspect_layer(Verified(), descriptor, "", {}, {})
+            MOD.inspect_layer(Verified(), descriptor, "", {}, {}, set())
 
     def test_standard_lib_alias_without_writes_is_allowed(self):
         report = self.check_layers([[("lib", (tarfile.SYMTYPE, "usr/lib")), (MODULE, b"original")]])
@@ -296,6 +296,80 @@ class ModuleHashTests(unittest.TestCase):
                                       ("intermediate", (tarfile.SYMTYPE, "usr/bin/other")),
                                       ("alias", (tarfile.SYMTYPE, "intermediate/../gamescope"))]],
                                     error="Alias can reach")
+
+    def test_rpm_gamescope_build_id_leaf_allowed(self):
+        alias = "usr/lib/.build-id/ac/c6aee92eb121b0b04beb38eef115c554df310e"
+        report = self.check_gamescope_layers([[(GAMESCOPE, b"original"),
+                                               ("usr/lib/.build-id", (tarfile.DIRTYPE, "")),
+                                               ("usr/lib/.build-id/ac", (tarfile.DIRTYPE, "")),
+                                               (alias, (tarfile.SYMTYPE,
+                                                        "../../../../usr/bin/gamescope"))]])
+        self.assertEqual(report["gamescope"]["sha256"], hashlib.sha256(b"original").hexdigest())
+
+    def test_build_id_regular_replacement_and_descendants_rejected(self):
+        alias = "usr/lib/.build-id/ac/c6aee92eb121b0b04beb38eef115c554df310e"
+        original = [(GAMESCOPE, b"original"),
+                    (alias, (tarfile.SYMTYPE, "../../../../usr/bin/gamescope"))]
+        for path in (alias, alias + "/child", "usr/lib/.build-id", "usr/lib/.build-id/ac"):
+            for layers in ([original, [(path, b"replacement")]],
+                           [[(path, b"replacement")], original]):
+                with self.subTest(path=path, layers=layers):
+                    self.check_gamescope_layers(layers, error="Build-ID alias modified")
+
+    def test_build_id_whiteouts_rejected(self):
+        alias = "usr/lib/.build-id/ac/c6aee92eb121b0b04beb38eef115c554df310e"
+        parent, leaf = alias.rsplit("/", 1)
+        for path in (parent + "/.wh." + leaf, parent + "/.wh..wh..opq",
+                     "usr/lib/.wh..build-id", "usr/lib/.build-id/.wh.ac"):
+            with self.subTest(path=path):
+                self.check_gamescope_layers([[(GAMESCOPE, b"original"),
+                                               (alias, (tarfile.SYMTYPE,
+                                                        "../../../../usr/bin/gamescope"))],
+                                              [(path, b"")]], error="Build-ID alias modified")
+
+    def test_build_id_retargets_and_nonstandard_links_rejected(self):
+        alias = "usr/lib/.build-id/ac/c6aee92eb121b0b04beb38eef115c554df310e"
+        original = [(GAMESCOPE, b"original"),
+                    (alias, (tarfile.SYMTYPE, "../../../../usr/bin/gamescope"))]
+        for target in ("/usr/bin/gamescope", "../../../../usr/bin", "../../../../tmp/unrelated"):
+            with self.subTest(target=target):
+                self.check_gamescope_layers([original, [(alias, (tarfile.SYMTYPE, target))]],
+                                            error="Alias can reach")
+        for path, target in ((alias + ".debug", "../../../../usr/bin/gamescope"),
+                             (alias, "/usr/bin/gamescope")):
+            with self.subTest(path=path, target=target):
+                self.check_gamescope_layers([[(GAMESCOPE, b"original"),
+                                               (path, (tarfile.SYMTYPE, target))]],
+                                            error="Alias can reach")
+
+    def test_build_id_linked_ancestors_and_descendants_rejected(self):
+        alias = "usr/lib/.build-id/ac/c6aee92eb121b0b04beb38eef115c554df310e"
+        for path in ("usr/lib/.build-id", "usr/lib/.build-id/ac", alias + "/child"):
+            with self.subTest(path=path):
+                self.check_gamescope_layers([[(GAMESCOPE, b"original"),
+                                               (alias, (tarfile.SYMTYPE,
+                                                        "../../../../usr/bin/gamescope")),
+                                               (path, (tarfile.SYMTYPE, "/tmp"))]],
+                                            error="Linked build-ID ancestor or descendant|Alias can reach")
+
+    def test_build_id_lib_alias_writes_rejected(self):
+        for path in ("lib/.build-id/ac/c6aee92eb121b0b04beb38eef115c554df310e",
+                     "lib/.wh..build-id"):
+            with self.subTest(path=path):
+                self.check_gamescope_layers([[(GAMESCOPE, b"original"),
+                                               ("lib", (tarfile.SYMTYPE, "usr/lib"))],
+                                              [(path, b"")]],
+                                            error="Noncanonical build-ID")
+
+    def test_build_id_generic_ancestor_alias_rejected(self):
+        alias = "usr/lib/.build-id/ac/c6aee92eb121b0b04beb38eef115c554df310e"
+        for target in ("usr/lib/.build-id", "usr/lib/.build-id/ac", alias):
+            with self.subTest(target=target):
+                self.check_gamescope_layers([[(GAMESCOPE, b"original"),
+                                               (alias, (tarfile.SYMTYPE,
+                                                        "../../../../usr/bin/gamescope")),
+                                               ("other", (tarfile.SYMTYPE, target))]],
+                                            error="Alias can reach")
 
 
 if __name__ == "__main__":

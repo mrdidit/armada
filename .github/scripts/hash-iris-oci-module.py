@@ -22,6 +22,7 @@ OCI = "application/vnd.oci.image."
 MODULE = "usr/lib/modules/7.2.6/kernel/drivers/media/platform/qcom/iris/qcom-iris.ko"
 TARGETS = {MODULE, MODULE + ".xz", MODULE + ".zst"}
 GAMESCOPE = "usr/bin/gamescope"
+BUILD_IDS = "usr/lib/.build-id"
 ARTIFACTS = TARGETS | {GAMESCOPE}
 GAMESCOPE_ALIASES = ("bin", "sbin", "usr/sbin")
 STANDARD_ALIASES = {
@@ -66,6 +67,8 @@ def check_alias_write(path):
     # written through them as if they were a distinct safe filesystem.
     require(not descendant(path, "lib/modules"),
             f"Noncanonical module path through /lib: {path}")
+    require(not descendant(path, "lib/.build-id"),
+            f"Noncanonical build-ID path through /lib: {path}")
     require(not any(descendant(path, alias + "/gamescope") for alias in GAMESCOPE_ALIASES),
             f"Noncanonical Gamescope path through a merged-/usr alias: {path}")
 
@@ -105,7 +108,14 @@ def resolve_aliases(parts, links):
     return resolved
 
 
-def verify_aliases(links):
+def verify_aliases(links, changes):
+    build_ids = {path for path, variants in links.items()
+                 if re.fullmatch(r"usr/lib/\.build-id/[0-9a-f]{2}/[0-9a-f]{38}", path)
+                 and ("../../../../usr/bin/gamescope", False) in variants}
+    build_id_parents = set()
+    for path in build_ids:
+        parts = path.split("/")
+        build_id_parents.update("/".join(parts[:i]) for i in range(1, len(parts)))
     for path, variants in links.items():
         for target, hardlink in variants:
             # Start at a symlink's containing directory; hardlinks use root.
@@ -114,7 +124,22 @@ def verify_aliases(links):
             targets, destination = STANDARD_ALIASES.get(path, (set(), None))
             standard_alias = (not hardlink and target in targets and
                               destinations == {destination})
-            require(standard_alias or not any(protected(p) for p in destinations),
+            build_id = (not hardlink and
+                        re.fullmatch(r"usr/lib/\.build-id/[0-9a-f]{2}/[0-9a-f]{38}", path) and
+                        target == "../../../../usr/bin/gamescope" and
+                        destinations == {GAMESCOPE} and len(variants) == 1)
+            if build_id:
+                require(not any(other != path and
+                                (descendant(path, other) or descendant(other, path))
+                                for other in links), "Linked build-ID ancestor or descendant")
+                require(not any(descendant(changed, path) or
+                                (not directory and descendant(path, changed))
+                                for changed, directory in changes),
+                        "Build-ID alias modified by another changeset")
+            require(standard_alias or build_id or not any(
+                    protected(p) or p in build_id_parents or
+                    any(descendant(p, build_id_path) for build_id_path in build_ids)
+                    for p in destinations),
                     f"Alias can reach an artifact or its ancestors: {path} -> {target}")
 
 
@@ -170,7 +195,7 @@ class Archive:
         return name
 
 
-def inspect_layer(archive, descriptor, expected_diffid, state, links):
+def inspect_layer(archive, descriptor, expected_diffid, state, links, changes):
     name = archive.verify_blob(descriptor)
     media = descriptor.get("mediaType")
     require(media in (OCI + "layer.v1.tar", OCI + "layer.v1.tar+gzip"),
@@ -191,6 +216,8 @@ def inspect_layer(archive, descriptor, expected_diffid, state, links):
                     "Overlay xattr whiteouts unsupported")
             parent, _, base = path.rpartition("/")
             check_alias_write(path)
+            if descendant(path, BUILD_IDS) and not member.issym():
+                changes.add((path, member.isdir()))
             if base.startswith(".wh."):
                 require(member.isreg() and member.size == 0,
                         f"Malformed OCI whiteout: {path}")
@@ -205,6 +232,8 @@ def inspect_layer(archive, descriptor, expected_diffid, state, links):
                     removed_path = (parent + "/" if parent else "") + base[4:]
                     check_alias_write(removed_path)
                     removed.append(removed_path)
+                if descendant(removed[-1], BUILD_IDS) or descendant(BUILD_IDS, removed[-1]):
+                    changes.add((removed[-1], False))
                 continue
             if member.issym() or member.islnk():
                 require("\x00" not in member.linkname and member.linkname,
@@ -274,11 +303,11 @@ def inspect(path, expected_manifest, expected_revision):
         diffids = config.get("rootfs", {}).get("diff_ids", [])
         require(config.get("rootfs", {}).get("type") == "layers" and
                 1 <= len(layers) <= 128 and len(layers) == len(diffids), "Invalid layer list")
-        state, evidence, links = {}, [], {}
+        state, evidence, links, changes = {}, [], {}, set()
         for layer, diffid in zip(layers, diffids):
             require(re.fullmatch(r"sha256:[0-9a-f]{64}", diffid), "Invalid diff ID")
-            evidence.append(inspect_layer(archive, layer, diffid, state, links))
-        verify_aliases(links)
+            evidence.append(inspect_layer(archive, layer, diffid, state, links, changes))
+        verify_aliases(links, changes)
         modules = [value for path, value in state.items() if path in TARGETS]
         require(len(modules) == 1, f"Expected exactly one installed module, found {len(modules)}")
         require(GAMESCOPE in state, "Missing installed Gamescope at /usr/bin/gamescope")
