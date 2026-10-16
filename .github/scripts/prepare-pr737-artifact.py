@@ -36,6 +36,7 @@ def inputs(environ):
         require(re.fullmatch(r"[1-9][0-9]{0,19}", value), f"Invalid {field}")
         result[field.lower()] = int(value)
     for field, length in (("HEAD_SHA", 40), ("MERGE_SHA", 40), ("TREE_SHA", 40),
+                          ("BASE_SHA", 40), ("MERGE_TREE_SHA", 40),
                           ("ARTIFACT_SHA256", 64)):
         value = environ.get("PR737_" + field, "")
         require(re.fullmatch(rf"[0-9a-f]{{{length}}}", value), f"Invalid {field}")
@@ -90,14 +91,12 @@ def validate_metadata(values, run, attempt, workflow, pr, head, merge, artifact,
             "Current PR head does not have the verified original tree")
     require(pr.get("base", {}).get("repo", {}).get("full_name") == UPSTREAM
             and pr["base"].get("ref") == "main", "Unexpected PR base")
-    if pr["head"]["sha"] == values["head_sha"]:
-        require(pr.get("merge_commit_sha") == values["merge_sha"], "PR merge commit changed")
     require(head.get("sha") == values["head_sha"]
             and head.get("tree", {}).get("sha") == values["tree_sha"], "Head tree mismatch")
     require(merge.get("sha") == values["merge_sha"]
-            and merge.get("tree", {}).get("sha") == values["tree_sha"], "Merge tree mismatch")
+            and merge.get("tree", {}).get("sha") == values["merge_tree_sha"], "Merge tree mismatch")
     require([p.get("sha") for p in merge.get("parents", [])]
-            == [pr["base"].get("sha"), values["head_sha"]], "Unexpected merge parents")
+            == [values["base_sha"], values["head_sha"]], "Unexpected merge parents")
     require(artifact.get("id") == values["artifact_id"]
             and artifact.get("name") == ARTIFACT_NAME
             and artifact.get("expired") is False, "Unexpected or expired artifact")
@@ -254,7 +253,7 @@ def main():
                                  "tree_sha": final_head["tree"]["sha"],
                                  "merge_commit_sha": final_pr.get("merge_commit_sha"),
                                  "head_matches_build": final_head["sha"] == values["head_sha"]},
-                  "iris_module": module["module"],
+                  "iris_module": module["module"], "gamescope": module["gamescope"],
                   "publisher_commit": os.environ.get("GITHUB_SHA"),
                   "publisher_run": os.environ.get("GITHUB_RUN_ID")}
     write_json(evidence / "publication.json", provenance)

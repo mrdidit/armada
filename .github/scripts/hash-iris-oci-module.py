@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Hash the installed Iris module in a pinned, local OCI archive without unpacking.
+"""Hash installed Iris and Gamescope in a pinned, local OCI archive without unpacking.
 
-Only regular-file module paths and directory parents are supported. Relevant
+Only regular-file artifact paths and directory parents are supported. Relevant
 links, sparse files, unknown compression, and malformed changesets fail closed.
 No image commands execute and no network access occurs.
 """
@@ -21,12 +21,22 @@ import tarfile
 OCI = "application/vnd.oci.image."
 MODULE = "usr/lib/modules/7.2.6/kernel/drivers/media/platform/qcom/iris/qcom-iris.ko"
 TARGETS = {MODULE, MODULE + ".xz", MODULE + ".zst"}
+GAMESCOPE = "usr/bin/gamescope"
+ARTIFACTS = TARGETS | {GAMESCOPE}
+GAMESCOPE_ALIASES = ("bin", "sbin", "usr/sbin")
+STANDARD_ALIASES = {
+    "lib": ({"usr/lib", "/usr/lib"}, "usr/lib"),
+    "bin": ({"usr/bin", "/usr/bin"}, "usr/bin"),
+    "sbin": ({"usr/sbin", "/usr/sbin", "usr/bin", "/usr/bin"}, "usr/bin"),
+    "usr/sbin": ({"bin", "/usr/bin"}, "usr/bin"),
+}
 PARENTS = set()
-for _name in TARGETS:
+for _name in ARTIFACTS:
     _parts = _name.split("/")
     PARENTS.update("/".join(_parts[:i]) for i in range(1, len(_parts)))
 MAX_JSON = 4 * 1024**2
 MAX_MODULE = 16 * 1024**2
+MAX_GAMESCOPE = 128 * 1024**2
 MAX_LAYER = 64 * 1024**3
 
 
@@ -48,14 +58,16 @@ def descendant(path, ancestor):
 
 
 def protected(path):
-    return path in PARENTS or not path or any(descendant(path, target) for target in TARGETS)
+    return path in PARENTS or not path or any(descendant(path, target) for target in ARTIFACTS)
 
 
 def check_alias_write(path):
-    # /lib -> usr/lib is common. Permit that link itself, never interpret a
-    # changeset written through it as if it were a distinct safe filesystem.
+    # Permit standard merged-/usr links themselves, never artifact changesets
+    # written through them as if they were a distinct safe filesystem.
     require(not descendant(path, "lib/modules"),
             f"Noncanonical module path through /lib: {path}")
+    require(not any(descendant(path, alias + "/gamescope") for alias in GAMESCOPE_ALIASES),
+            f"Noncanonical Gamescope path through a merged-/usr alias: {path}")
 
 
 def resolve_aliases(parts, links):
@@ -99,10 +111,11 @@ def verify_aliases(links):
             # Start at a symlink's containing directory; hardlinks use root.
             prefix = [] if target.startswith("/") or hardlink else path.split("/")[:-1]
             destinations = resolve_aliases(prefix + target.split("/"), links)
-            standard_lib = (path == "lib" and not hardlink and
-                            target in ("usr/lib", "/usr/lib") and destinations == {"usr/lib"})
-            require(standard_lib or not any(protected(p) for p in destinations),
-                    f"Alias can reach the module tree or an ancestor: {path} -> {target}")
+            targets, destination = STANDARD_ALIASES.get(path, (set(), None))
+            standard_alias = (not hardlink and target in targets and
+                              destinations == {destination})
+            require(standard_alias or not any(protected(p) for p in destinations),
+                    f"Alias can reach an artifact or its ancestors: {path} -> {target}")
 
 
 class HashReader:
@@ -182,7 +195,8 @@ def inspect_layer(archive, descriptor, expected_diffid, state, links):
                 require(member.isreg() and member.size == 0,
                         f"Malformed OCI whiteout: {path}")
                 if base == ".wh..wh..opq":
-                    require(parent != "lib", "Opaque whiteout through /lib alias")
+                    require(parent not in ("lib", *GAMESCOPE_ALIASES),
+                            f"Opaque whiteout through /{parent} alias")
                     removed.append(parent)
                 else:
                     require(base[4:] not in ("", ".", "..") and
@@ -197,20 +211,22 @@ def inspect_layer(archive, descriptor, expected_diffid, state, links):
                         f"Invalid link target: {path}")
                 links.setdefault(path, set()).add((member.linkname, member.islnk()))
             if path in PARENTS:
-                require(member.isdir(), f"Non-directory module ancestor: {path}")
-            require(not any(path != target and descendant(path, target) for target in TARGETS),
-                    f"Entry nested under a module filename: {path}")
+                require(member.isdir(), f"Non-directory artifact ancestor: {path}")
+            require(not any(path != target and descendant(path, target) for target in ARTIFACTS),
+                    f"Entry nested under an artifact filename: {path}")
             if member.islnk():
                 linked = canonical(member.linkname)
-                require(linked not in TARGETS and linked not in PARENTS,
-                        f"Hardlink aliases the module or its ancestors: {path}")
-            if path not in TARGETS:
+                require(linked not in ARTIFACTS and linked not in PARENTS,
+                        f"Hardlink aliases an artifact or its ancestors: {path}")
+            if path not in ARTIFACTS:
                 continue
+            artifact = "Gamescope" if path == GAMESCOPE else "Module"
             require(member.isreg() and not member.sparse,
-                    f"Module is linked, sparse or nonregular: {path}")
-            require(0 < member.size <= MAX_MODULE, "Invalid module size")
-            with layer.extractfile(member) as module:
-                digest = hashlib.file_digest(module, "sha256").hexdigest()
+                    f"{artifact} is linked, sparse or nonregular: {path}")
+            limit = MAX_GAMESCOPE if path == GAMESCOPE else MAX_MODULE
+            require(0 < member.size <= limit, f"Invalid {artifact.lower()} size")
+            with layer.extractfile(member) as source_file:
+                digest = hashlib.file_digest(source_file, "sha256").hexdigest()
             added[path] = {"path": "/" + path, "sha256": digest,
                            "size": member.size, "layer_digest": descriptor["digest"]}
         # Complete decompression also validates gzip CRC and the full OCI diff ID.
@@ -225,7 +241,9 @@ def inspect_layer(archive, descriptor, expected_diffid, state, links):
     state.update(added)
     return {"digest": descriptor["digest"], "diff_id": expected_diffid,
             "members": len(seen), "expanded_bytes": hashed.size,
-            "module_changes": list(added), "whiteouts": len(removed)}
+            "module_changes": [path for path in added if path in TARGETS],
+            "gamescope_changes": [path for path in added if path == GAMESCOPE],
+            "whiteouts": len(removed)}
 
 
 def inspect(path, expected_manifest, expected_revision):
@@ -261,10 +279,12 @@ def inspect(path, expected_manifest, expected_revision):
             require(re.fullmatch(r"sha256:[0-9a-f]{64}", diffid), "Invalid diff ID")
             evidence.append(inspect_layer(archive, layer, diffid, state, links))
         verify_aliases(links)
-        require(len(state) == 1, f"Expected exactly one installed module, found {len(state)}")
+        modules = [value for path, value in state.items() if path in TARGETS]
+        require(len(modules) == 1, f"Expected exactly one installed module, found {len(modules)}")
+        require(GAMESCOPE in state, "Missing installed Gamescope at /usr/bin/gamescope")
         return {"manifest_digest": expected_manifest, "image_revision": expected_revision,
                 "image_version": labels.get("org.opencontainers.image.version"),
-                "module": next(iter(state.values())), "layers_verified": evidence,
+                "module": modules[0], "gamescope": state[GAMESCOPE], "layers_verified": evidence,
                 "method": "OCI layer content hashes with relevant whiteout application; no image execution",
                 "device_observation_used": False}
     finally:

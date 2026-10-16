@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Synthetic, offline checks for OCI module identity; no runtime code executes."""
+"""Synthetic, offline OCI artifact identity checks; no runtime code executes."""
 import gzip
 import hashlib
 import importlib.util
@@ -9,6 +9,7 @@ from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 HERE = Path(__file__).parent
 SPEC = importlib.util.spec_from_file_location("iris_oci", HERE / "hash-iris-oci-module.py")
@@ -16,6 +17,7 @@ MOD = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MOD)
 REVISION = "e" * 40
 MODULE = MOD.MODULE
+GAMESCOPE = MOD.GAMESCOPE
 DIRECTORY = MODULE.rsplit("/", 1)[0]
 
 
@@ -62,7 +64,10 @@ def make_archive(path, layers, *, compressed=False, corrupt=False):
 
 
 class ModuleHashTests(unittest.TestCase):
-    def check_layers(self, layers, *, compressed=False, corrupt=False, error=None):
+    def check_layers(self, layers, *, compressed=False, corrupt=False, error=None,
+                     add_gamescope=True):
+        if add_gamescope:
+            layers = [[(GAMESCOPE, b"gamescope"), *layers[0]], *layers[1:]]
         with tempfile.TemporaryDirectory(dir=HERE, prefix="oci-hash-test-") as directory:
             archive = Path(directory) / "image.tar"
             digest = make_archive(archive, layers, compressed=compressed, corrupt=corrupt)
@@ -71,6 +76,10 @@ class ModuleHashTests(unittest.TestCase):
                     MOD.inspect(archive, digest, REVISION)
                 return None
             return MOD.inspect(archive, digest, REVISION)
+
+    def check_gamescope_layers(self, layers, **kwargs):
+        return self.check_layers([[(MODULE, b"module")], *layers],
+                                 add_gamescope=False, **kwargs)
 
     def test_original(self):
         report = self.check_layers([[(MODULE, b"module")]])
@@ -110,7 +119,7 @@ class ModuleHashTests(unittest.TestCase):
 
     def test_symlink_parent_rejected(self):
         self.check_layers([[("usr/lib/modules", (tarfile.SYMTYPE, "/elsewhere")),
-                            (MODULE, b"one")]], error="Non-directory module ancestor")
+                            (MODULE, b"one")]], error="Non-directory artifact ancestor")
 
     def test_hardlinked_module_rejected(self):
         self.check_layers([[(MODULE, (tarfile.LNKTYPE, "other/module"))]], error="linked")
@@ -174,6 +183,119 @@ class ModuleHashTests(unittest.TestCase):
                             ("intermediate", (tarfile.SYMTYPE, DIRECTORY + "/other")),
                             ("alias", (tarfile.SYMTYPE, "intermediate/../qcom-iris.ko"))]],
                           error="Alias can reach")
+
+    def test_gamescope_final_bytes_and_provenance(self):
+        final = [(GAMESCOPE, b"new gamescope")]
+        report = self.check_gamescope_layers([[(GAMESCOPE, b"old")], final,
+                                              [("etc/unrelated", b"last layer")]])
+        self.assertEqual(report["gamescope"], {
+            "path": "/usr/bin/gamescope", "size": len(b"new gamescope"),
+            "sha256": hashlib.sha256(b"new gamescope").hexdigest(),
+            "layer_digest": "sha256:" + hashlib.sha256(tar(final)).hexdigest(),
+        })
+        self.assertEqual(report["layers_verified"][0]["module_changes"], [MODULE])
+        self.assertEqual(report["layers_verified"][2]["module_changes"], [])
+        self.assertEqual(report["layers_verified"][2]["gamescope_changes"], [GAMESCOPE])
+
+    def test_gamescope_gzip_layer(self):
+        report = self.check_gamescope_layers([[(GAMESCOPE, b"executable bytes")]], compressed=True)
+        self.assertEqual(report["gamescope"]["sha256"],
+                         hashlib.sha256(b"executable bytes").hexdigest())
+
+    def test_gamescope_missing_rejected(self):
+        self.check_gamescope_layers([], error="Missing installed Gamescope")
+
+    def test_gamescope_whiteouts_remove_lower_file(self):
+        for whiteout in ("usr/bin/.wh.gamescope", "usr/bin/.wh..wh..opq", "usr/.wh.bin"):
+            with self.subTest(whiteout=whiteout):
+                self.check_gamescope_layers([[(GAMESCOPE, b"old")], [(whiteout, b"")]],
+                                            error="Missing installed Gamescope")
+
+    def test_gamescope_whiteouts_preserve_same_layer_addition(self):
+        for whiteout in ("usr/bin/.wh.gamescope", "usr/bin/.wh..wh..opq", "usr/.wh.bin"):
+            with self.subTest(whiteout=whiteout):
+                report = self.check_gamescope_layers([[(GAMESCOPE, b"old")],
+                                                      [(GAMESCOPE, b"new"), (whiteout, b"")]])
+                self.assertEqual(report["gamescope"]["sha256"], hashlib.sha256(b"new").hexdigest())
+
+    def test_gamescope_nonregular_file_rejected(self):
+        for kind in (tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.DIRTYPE, tarfile.FIFOTYPE):
+            with self.subTest(kind=kind):
+                self.check_gamescope_layers([[(GAMESCOPE, (kind, "other/file"))]],
+                                            error="Gamescope is linked, sparse or nonregular")
+
+    def test_gamescope_size_limit(self):
+        with patch.object(MOD, "MAX_GAMESCOPE", 8):
+            for contents in (b"", b"012345678"):
+                with self.subTest(size=len(contents)):
+                    self.check_gamescope_layers([[(GAMESCOPE, contents)]],
+                                                error="Invalid gamescope size")
+            report = self.check_gamescope_layers([[(GAMESCOPE, b"01234567")]])
+            self.assertEqual(report["gamescope"]["size"], 8)
+
+    def test_gamescope_ancestor_link_rejected(self):
+        self.check_gamescope_layers([[("usr/bin", (tarfile.SYMTYPE, "/elsewhere")),
+                                      (GAMESCOPE, b"original")]],
+                                    error="Non-directory artifact ancestor")
+
+    def test_gamescope_nested_entry_rejected(self):
+        self.check_gamescope_layers([[(GAMESCOPE, b"original"), (GAMESCOPE + "/child", b"bad")]],
+                                    error="nested under")
+
+    def test_gamescope_hardlink_alias_rejected(self):
+        for target in (GAMESCOPE, "usr/bin"):
+            with self.subTest(target=target):
+                self.check_gamescope_layers([[(GAMESCOPE, b"original"),
+                                              ("alias", (tarfile.LNKTYPE, target))]],
+                                            error="Hardlink aliases")
+
+    def test_standard_bin_aliases_without_writes_allowed(self):
+        for target in ("usr/bin", "/usr/bin"):
+            with self.subTest(target=target):
+                report = self.check_gamescope_layers([[("bin", (tarfile.SYMTYPE, target)),
+                                                      (GAMESCOPE, b"original")]])
+                self.assertEqual(report["gamescope"]["sha256"], hashlib.sha256(b"original").hexdigest())
+
+    def test_standard_sbin_aliases_without_writes_allowed(self):
+        for target in ("usr/bin", "/usr/bin", "usr/sbin", "/usr/sbin"):
+            with self.subTest(target=target):
+                report = self.check_gamescope_layers([[("bin", (tarfile.SYMTYPE, "usr/bin")),
+                                                      ("sbin", (tarfile.SYMTYPE, target)),
+                                                      ("usr/sbin", (tarfile.SYMTYPE, "bin")),
+                                                      (GAMESCOPE, b"original")]])
+                self.assertEqual(report["gamescope"]["path"], "/usr/bin/gamescope")
+
+    def test_gamescope_alias_writes_and_whiteouts_rejected(self):
+        aliases = [("bin", (tarfile.SYMTYPE, "usr/bin")),
+                   ("sbin", (tarfile.SYMTYPE, "usr/sbin")),
+                   ("usr/sbin", (tarfile.SYMTYPE, "bin"))]
+        for alias in ("bin", "sbin", "usr/sbin"):
+            for basename, contents in (("gamescope", b"replacement"), (".wh.gamescope", b""),
+                                       (".wh..wh..opq", b"")):
+                with self.subTest(alias=alias, basename=basename):
+                    self.check_gamescope_layers([[*aliases, (GAMESCOPE, b"original")],
+                                                  [(alias + "/" + basename, contents)]],
+                                                error="Noncanonical Gamescope path|Opaque whiteout")
+
+    def test_gamescope_arbitrary_alias_rejected(self):
+        for target in (GAMESCOPE, "usr/bin", "/usr/bin", "bin", "sbin"):
+            with self.subTest(target=target):
+                self.check_gamescope_layers([[(GAMESCOPE, b"original"),
+                                              ("bin", (tarfile.SYMTYPE, "usr/bin")),
+                                              ("sbin", (tarfile.SYMTYPE, "usr/bin")),
+                                              ("alias", (tarfile.SYMTYPE, target))]],
+                                            error="Alias can reach")
+
+    def test_gamescope_historical_alias_rejected_after_deletion(self):
+        self.check_gamescope_layers([[(GAMESCOPE, b"original"),
+                                      ("alias", (tarfile.SYMTYPE, "usr/bin"))],
+                                     [(".wh.alias", b"")]], error="Alias can reach")
+
+    def test_gamescope_alias_parent_resolution_after_symlink(self):
+        self.check_gamescope_layers([[(GAMESCOPE, b"original"),
+                                      ("intermediate", (tarfile.SYMTYPE, "usr/bin/other")),
+                                      ("alias", (tarfile.SYMTYPE, "intermediate/../gamescope"))]],
+                                    error="Alias can reach")
 
 
 if __name__ == "__main__":

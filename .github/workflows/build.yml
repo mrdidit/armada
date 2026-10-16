@@ -21,7 +21,15 @@ on:
         required: true
         type: string
       expected_tree_sha:
-        description: Expected Git tree SHA shared by the PR head and merge
+        description: Expected Git tree SHA of the PR head
+        required: true
+        type: string
+      expected_base_sha:
+        description: Full base commit SHA used by the upstream build
+        required: true
+        type: string
+      expected_merge_tree_sha:
+        description: Expected Git tree SHA of the built synthetic merge
         required: true
         type: string
       artifact_id:
@@ -54,6 +62,8 @@ jobs:
       PR737_HEAD_SHA: ${{ inputs.expected_head_sha }}
       PR737_MERGE_SHA: ${{ inputs.expected_merge_sha }}
       PR737_TREE_SHA: ${{ inputs.expected_tree_sha }}
+      PR737_BASE_SHA: ${{ inputs.expected_base_sha }}
+      PR737_MERGE_TREE_SHA: ${{ inputs.expected_merge_tree_sha }}
       PR737_ARTIFACT_ID: ${{ inputs.artifact_id }}
       PR737_ARTIFACT_SHA256: ${{ inputs.artifact_sha256 }}
     steps:

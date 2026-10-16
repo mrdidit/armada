@@ -25,7 +25,8 @@ spec.loader.exec_module(oci_fixture)
 
 def fixture():
     values = dict(run_id=123, run_attempt=2, artifact_id=456, head_sha="a" * 40,
-                  merge_sha="b" * 40, tree_sha="c" * 40, artifact_sha256="d" * 64)
+                  merge_sha="b" * 40, tree_sha="c" * 40, artifact_sha256="d" * 64,
+                  base_sha="e" * 40, merge_tree_sha="9" * 40)
     run = dict(id=123, run_attempt=2, status="completed", conclusion="success",
                event="pull_request", path=".github/workflows/pr.yml", workflow_id=789,
                repository={"full_name": prepare.UPSTREAM},
@@ -38,8 +39,8 @@ def fixture():
                     "sha": values["head_sha"]},
               base={"repo": {"full_name": prepare.UPSTREAM}, "ref": "main", "sha": "e" * 40})
     head = dict(sha=values["head_sha"], tree={"sha": values["tree_sha"]})
-    merge = dict(sha=values["merge_sha"], tree={"sha": values["tree_sha"]},
-                 parents=[{"sha": pr["base"]["sha"]}, {"sha": values["head_sha"]}])
+    merge = dict(sha=values["merge_sha"], tree={"sha": values["merge_tree_sha"]},
+                 parents=[{"sha": values["base_sha"]}, {"sha": values["head_sha"]}])
     artifact = dict(id=456, name=prepare.ARTIFACT_NAME, expired=False,
                     digest="sha256:" + values["artifact_sha256"], size_in_bytes=100,
                     created_at="2026-10-15T20:30:00Z",
@@ -56,6 +57,17 @@ class ProvenanceTests(unittest.TestCase):
     def test_exact_successful_source_passes(self):
         prepare.validate_metadata(*fixture())
 
+    def test_upstream_advance_keeps_original_build_identity(self):
+        args = fixture()
+        args[4]["base"]["sha"] = "2" * 40
+        args[4]["merge_commit_sha"] = "3" * 40
+        prepare.validate_metadata(*args)
+        for field in ("base_sha", "merge_tree_sha", "merge_sha", "tree_sha"):
+            changed = copy.deepcopy(args)
+            changed[0][field] = "0" * 40
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                prepare.validate_metadata(*changed)
+
     def test_rewritten_current_head_requires_the_original_tree(self):
         args = fixture()
         args[4]["head"]["sha"] = "f" * 40
@@ -71,7 +83,8 @@ class ProvenanceTests(unittest.TestCase):
         for index, path, value in (
                 (1, ("head_sha",), "f" * 40), (1, ("run_attempt",), 3),
                 (1, ("conclusion",), "failure"), (2, ("run_attempt",), 3),
-                (4, ("base", "sha"), "1" * 40),
+                (0, ("base_sha",), "1" * 40),
+                (0, ("merge_tree_sha",), "1" * 40),
                 (5, ("sha",), "f" * 40), (5, ("tree", "sha"), "1" * 40),
                 (6, ("sha",), "1" * 40), (6, ("tree", "sha"), "1" * 40),
                 (7, ("id",), 999), (7, ("workflow_run", "head_sha"), "f" * 40),
@@ -112,7 +125,8 @@ class ProvenanceTests(unittest.TestCase):
             (1, ("head_sha",), "0" * 40), (3, ("id",), 111),
             (4, ("number",), 738), (4, ("state",), "closed"),
             (4, ("head", "sha"), "0" * 40),
-            (4, ("merge_commit_sha",), "0" * 40),
+            (0, ("base_sha",), "0" * 40),
+            (0, ("merge_tree_sha",), "0" * 40),
             (5, ("tree", "sha"), "0" * 40),
             (6, ("parents",), [{"sha": "0" * 40}]),
             (6, ("tree", "sha"), "0" * 40),
@@ -138,7 +152,8 @@ class ProvenanceTests(unittest.TestCase):
         env = {"PR737_" + key.upper(): str(value) for key, value in fixture()[0].items()}
         self.assertEqual(prepare.inputs(env), fixture()[0])
         for key, value in (("PR737_RUN_ID", "123; echo bad"), ("PR737_RUN_ID", "0"),
-                           ("PR737_HEAD_SHA", "$(id)"), ("PR737_ARTIFACT_SHA256", "F" * 64)):
+                           ("PR737_HEAD_SHA", "$(id)"), ("PR737_BASE_SHA", "../base"),
+                           ("PR737_MERGE_TREE_SHA", ""), ("PR737_ARTIFACT_SHA256", "F" * 64)):
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                 prepare.inputs({**env, key: value})
 
@@ -246,7 +261,8 @@ class PreparationTests(unittest.TestCase):
             archive = root / prepare.ARCHIVE_NAME
             with mock.patch.object(oci_fixture, "REVISION", values["merge_sha"]):
                 digest = oci_fixture.make_archive(archive,
-                    [[(oci_fixture.MODULE + ".xz", b"original module bytes")]],
+                    [[(oci_fixture.MODULE + ".xz", b"original module bytes"),
+                      (oci_fixture.MOD.GAMESCOPE, b"original gamescope bytes")]],
                     compressed=True, corrupt=corrupt_module)
             config, manifest = ImageTests().fixture()
             def command(command):
@@ -291,6 +307,9 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(module["image_revision"], original["merge_sha"])
         self.assertEqual(module["module"], result["iris_module"])
         self.assertEqual(module["module"]["sha256"], hashlib.sha256(b"original module bytes").hexdigest())
+        self.assertEqual(module["gamescope"], result["gamescope"])
+        self.assertEqual(result["gamescope"]["sha256"],
+                         hashlib.sha256(b"original gamescope bytes").hexdigest())
         self.assertFalse(module["device_observation_used"])
         self.assertIn("upstream-final-current-head.json", files)
 
