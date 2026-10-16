@@ -1,307 +1,95 @@
 ---
-name: Build images
+name: Build Gamescope capture test
+
 on:
-  push:
-    branches:
-      - main
-      - staging
   workflow_dispatch:
 
-env:
-  ARMADA_CANONICAL_IMAGE: "ghcr.io/armada-os/armada"
-  ARMADA_LEGACY_IMAGE: "ghcr.io/virtudude/armada"
-  BASE_IMAGE: "quay.io/fedora/fedora-bootc:44"
-  IMAGE_DESC: "Armada: a gaming-focused, SteamOS-like Fedora bootc image for ARM64 handhelds"
-  IMAGE_NAME: "${{ github.event.repository.name }}"
-  IMAGE_REGISTRY: "ghcr.io/${{ github.repository_owner }}"
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: gamescope-capture-test
   cancel-in-progress: false
-  queue: max
 
 jobs:
-  packages:
-    name: Packages
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/packages.yml
-    secrets: inherit
-
-  build_push:
-    name: Container image
-    needs: packages
+  gamescope:
+    if: github.repository == 'mrdidit/armada' && github.ref == 'refs/heads/test-gamescope-pipewire-20261016'
     runs-on: ubuntu-24.04-arm
-    outputs:
-      channel: ${{ steps.channel.outputs.channel }}
-      tag: ${{ steps.channel.outputs.tag }}
-      digest: ${{ steps.push.outputs.digest }}
-      revision: ${{ steps.version.outputs.revision }}
-
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-
+    timeout-minutes: 90
     steps:
-      - name: Prepare environment
-        run: |
-          echo "IMAGE_REGISTRY=${IMAGE_REGISTRY,,}" >> ${GITHUB_ENV}
-          echo "IMAGE_NAME=${IMAGE_NAME,,}" >> ${GITHUB_ENV}
-
-      - name: Resolve publication channel
-        id: channel
-        env:
-          BUILD_REF: ${{ github.ref }}
-        run: |
-          set -euo pipefail
-          if [[ "${BUILD_REF}" != refs/heads/* ]]; then
-            echo "::error::Select a branch to build."
-            exit 1
-          fi
-          branch="${BUILD_REF#refs/heads/}"
-          case "${branch}" in
-            main) tag=testing; channel=preview ;;
-            staging) tag=staging; channel=staging ;;
-            testing|preview|beta|stable|latest)
-              echo "::error::Reserved release channel. Build main/staging or use Promote channel."
-              exit 1 ;;
-            *) tag="${branch}"; channel="" ;;
-          esac
-          if ! [[ "${tag}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
-            echo "::error::Branch cannot be used as a container tag."
-            exit 1
-          fi
-          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
-          echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
-
-      - name: Install container tools
-        run: |
-          set -euxo pipefail
-          # ubuntu-24.04 dropped these from the runner image; the build action,
-          # validation, and push all need them.
-          need=""
-          for t in buildah jq skopeo; do
-            command -v "$t" >/dev/null || need="$need $t"
-          done
-          [ -z "$need" ] || { sudo apt-get update && sudo apt-get install -y $need; }
-
-      - name: Check signing key
-        run: |
-          if [ -z "${{ secrets.SIGNING_SECRET }}" ]; then
-            echo "::error::SIGNING_SECRET is not set — refusing to publish an unsigned image (devices verify ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }})."
-            exit 1
-          fi
-
-      - name: Check out source
+      - name: Check out the exact test source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          persist-credentials: false
 
-      - name: Install just
-        uses: ublue-os/just-action@30ab4659369934b65b655bf8d2fa4ddd6547d384 # v3
-
-      - name: Get image version
-        id: version
+      - name: Check native ARM builder and install RPM inspection tools
         run: |
-          echo "created=$(date -u +%Y\-%m\-%d\T%H\:%M\:%S\Z)" >> $GITHUB_OUTPUT
-          echo "version=$(TZ=America/New_York date +%Y%m%d).$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          docker buildx version
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rpm
 
-      - name: Generate image metadata
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        id: metadata
+      - name: Build only the Gamescope package
+        run: |
+          set -euo pipefail
+          source packages/toolchain.env
+          source packages/mesa-x86/BASE.env
+          source packages/TERRA.env
+          output="$RUNNER_TEMP/gamescope-capture"
+          mkdir -p "$output/evidence"
+          git rev-parse HEAD > "$output/evidence/source-commit.txt"
+          git rev-parse 'HEAD^{tree}' > "$output/evidence/source-tree.txt"
+          printf '%s\n' "$BUILDER_IMAGE" > "$output/evidence/builder-image.txt"
+          printf '%s\n' "$TERRA_COMMIT" > "$output/evidence/terra-commit.txt"
+          cp packages/gamescope/patches/0029-pipewire-rework-buffer-sharing-to-be-thread-safe.patch "$output/evidence/"
+          docker buildx build \
+            --platform linux/arm64 \
+            --file packages/Containerfile \
+            --target out-gamescope \
+            --build-arg "BUILDER_IMAGE=$BUILDER_IMAGE" \
+            --build-arg "GUEST_BUILDER_IMAGE=$GUEST_BUILDER_IMAGE" \
+            --output "type=local,dest=$output/packages" \
+            --progress plain \
+            packages 2>&1 | tee "$output/evidence/build.log"
+
+      - name: Verify package identity and record checksums
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/gamescope-capture"
+          python3 - "$output" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import subprocess
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          packages = sorted((root / "packages/rpms").glob("*.rpm"))
+          assert packages, "The build produced no RPMs"
+          records = []
+          for path in packages:
+              header = subprocess.check_output([
+                  "rpm", "-qp", "--queryformat", "%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}", str(path)
+              ], text=True).split("\t")
+              name, version, arch = header
+              assert name.startswith("terra-gamescope"), header
+              assert arch in ("aarch64", "noarch"), header
+              records.append({"file": str(path.relative_to(root)), "name": name,
+                              "version": version, "arch": arch,
+                              "sha256": hashlib.file_digest(path.open("rb"), "sha256").hexdigest()})
+          assert {"terra-gamescope", "terra-gamescope-libs"} <= {r["name"] for r in records}
+          (root / "evidence/packages.json").write_text(json.dumps(records, indent=2) + "\n")
+          (root / "SHA256SUMS").write_text("".join(f'{r["sha256"]}  {r["file"]}\n' for r in records))
+          print(json.dumps(records, indent=2))
+          PY
+
+      - name: Upload component and build evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          tags: |
-            type=raw,value=${{ steps.channel.outputs.tag }}
-          labels: |
-            org.opencontainers.image.revision=${{ steps.version.outputs.revision }}
-            org.opencontainers.image.created=${{ steps.version.outputs.created }}
-            org.opencontainers.image.description=${{ env.IMAGE_DESC }}
-            org.opencontainers.image.documentation=https://raw.githubusercontent.com/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}/${{ steps.version.outputs.revision }}/README.md
-            org.opencontainers.image.licenses=GPL-2.0-or-later
-            org.opencontainers.image.source=https://github.com/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}/blob/${{ steps.version.outputs.revision }}/Containerfile
-            org.opencontainers.image.title=${{ env.IMAGE_NAME }}
-            org.opencontainers.image.url=https://github.com/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}/tree/${{ steps.version.outputs.revision }}
-            org.opencontainers.image.vendor=${{ github.repository_owner }}
-            org.opencontainers.image.version=${{ steps.version.outputs.version }}
-            containers.bootc=1
-          sep-tags: " "
-          sep-annotations: " "
-
-      - name: Prepare Chunkah config
-        id: chunkah_config
-        env:
-          METADATA_JSON: ${{ steps.metadata.outputs.json }}
-        run: |
-          set -euo pipefail
-          base_digest=$(skopeo inspect --override-arch arm64 --format '{{.Digest}}' \
-            "docker://${BASE_IMAGE}")
-          base_image="${BASE_IMAGE%:*}@${base_digest}"
-          config=$(skopeo inspect --override-arch arm64 --config \
-            "docker://${base_image}" |
-            jq -c --argjson metadata "${METADATA_JSON}" '
-              .config |
-              .Labels = ((.Labels // {}) + ($metadata.labels // {})) |
-              del(.Labels["ostree.commit"]) |
-              del(.Labels["ostree.final-diffid"])')
-          printf '%s\n' "${config}" > "${RUNNER_TEMP}/chunkah-config.json"
-          echo "base_image=${base_image}" >> "${GITHUB_OUTPUT}"
-          echo "config=${config}" >> "${GITHUB_OUTPUT}"
-
-      - name: Resolve package refs
-        env:
-          BUILD_ARGS: ${{ needs.packages.outputs.build_args }}
-        run: |
-          set -euo pipefail
-          # One <PKG>_REF=<image> line per package, from the Packages workflow.
-          # Unchanged packages resolve to an image built by an earlier run.
-          printf '%s' "${BUILD_ARGS}" > "${RUNNER_TEMP}/package-refs.env"
-          expected=$(grep -c '^ARG [A-Z0-9_]*_REF$' Containerfile)
-          got=$(grep -c '_REF=' "${RUNNER_TEMP}/package-refs.env")
-          if [ "${expected}" -ne "${got}" ]; then
-            echo "::error::Containerfile wants ${expected} package refs, resolver gave ${got}"
-            exit 1
-          fi
-          echo "Resolved ${got} package refs:" && cat "${RUNNER_TEMP}/package-refs.env"
-
-      - name: Require native OverlayFS
-        run: |
-          set -euxo pipefail
-          buildah info --storage-opt=overlay.mount_program= |
-            jq -e '.store.GraphStatus["Native Overlay Diff"] == "true"'
-
-      - name: Build container image
-        id: build_image
-        uses: redhat-actions/buildah-build@719e3c40d8af9790c23eca13f7daa339f2867034 # v3.1.0
-        with:
-          containerfiles: |
-            ./Containerfile
-          image: ${{ env.IMAGE_NAME }}
-          tags: build-output
-          labels: ${{ steps.metadata.outputs.labels }}
-          build-args: |
-            ARMADA_VERSION=${{ steps.version.outputs.version }}
-            BASE_IMAGE=${{ steps.chunkah_config.outputs.base_image }}
-            CHUNKAH_CONFIG_STR=${{ steps.chunkah_config.outputs.config }}
-          # armada-rootfs is consumed through RUN --mount, so retain otherwise-unused stages.
-          extra-args: |
-            --build-arg-file=${{ runner.temp }}/package-refs.env
-            --skip-unused-stages=false
-            --target=chunkah
-            --volume=${{ runner.temp }}:/run/src
-            --security-opt=label=disable
-            --storage-opt=overlay.mount_program=
-          oci: false
-
-      - name: Validate Chunkah output
-        id: chunkah_output
-        run: ./.github/scripts/validate-chunkah-output.sh build
-
-      - name: Push container to GHCR
-        id: push
-        run: |
-          set -euxo pipefail
-          echo "${{ secrets.GITHUB_TOKEN }}" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
-          IMAGE_FULL="${IMAGE_REGISTRY}/${IMAGE_NAME}"
-          BUILD_TAG="build-${{ steps.version.outputs.version }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          n=0
-          until skopeo copy --all \
-                "${{ steps.chunkah_output.outputs.ref }}" "docker://${IMAGE_FULL}:${BUILD_TAG}"; do
-            n=$((n + 1)); [ "${n}" -ge 3 ] && exit 1; sleep 15
-          done
-          digest=$(skopeo inspect --format '{{.Digest}}' "docker://${IMAGE_FULL}:${BUILD_TAG}")
-          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
-
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        if: env.HAVE_SIGNING_SECRET == 'true'
-        env:
-          HAVE_SIGNING_SECRET: ${{ secrets.SIGNING_SECRET != '' }}
-        with:
-          cosign-release: 'v2.6.3'
-
-      - name: Sign container image
-        if: env.HAVE_SIGNING_SECRET == 'true'
-        run: |
-          set -euo pipefail
-          IMAGE_FULL="${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}"
-          IMAGE_REF="${IMAGE_FULL}@${{ steps.push.outputs.digest }}"
-          # Cosign and Skopeo use separate registry auth stores.
-          echo "${{ secrets.GITHUB_TOKEN }}" | cosign login ghcr.io -u "${{ github.actor }}" --password-stdin
-          # Sign the digest, not a tag (a concurrent run could re-point the tag).
-          # --new-bundle-format=false: bootc's verifier expects the legacy .sig; the
-          # default flips in cosign v3.
-          cosign sign -y --new-bundle-format=false --key env://COSIGN_PRIVATE_KEY "${IMAGE_REF}"
-
-          # Legacy-hosted images also need the canonical identity required by bridge policy.
-          if [ "${IMAGE_FULL}" = "${ARMADA_LEGACY_IMAGE}" ]; then
-            cosign sign -y --new-bundle-format=false \
-              --key env://COSIGN_PRIVATE_KEY \
-              --sign-container-identity "${ARMADA_CANONICAL_IMAGE}" \
-              "${IMAGE_REF}"
-          fi
-
-          if [ "${{ github.event.repository.fork }}" != "true" ]; then
-            cosign verify --key system_files/etc/pki/containers/armada.pub "${IMAGE_REF}"
-            if [ "${IMAGE_FULL}" = "${ARMADA_LEGACY_IMAGE}" ]; then
-              cosign verify --check-claims=false \
-                --key system_files/etc/pki/containers/armada.pub \
-                "${IMAGE_REF}" |
-                jq -s -e --arg identity "${ARMADA_CANONICAL_IMAGE}" \
-                  'any(.. | objects; .critical?.identity?["docker-reference"]? == $identity)'
-            fi
-          fi
-        env:
-          HAVE_SIGNING_SECRET: ${{ secrets.SIGNING_SECRET != '' }}
-          TAGS: ${{ steps.push.outputs.digest }}
-          COSIGN_EXPERIMENTAL: false
-          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
-
-      - name: Publish channel tags
-        if: env.HAVE_SIGNING_SECRET == 'true'
-        run: |
-          set -euo pipefail
-          IMAGE_FULL="${IMAGE_REGISTRY}/${IMAGE_NAME}"
-          SRC="docker://${IMAGE_FULL}@${{ steps.push.outputs.digest }}"
-          for tag in ${{ steps.metadata.outputs.tags }}; do
-            n=0
-            until skopeo copy --all "${SRC}" "docker://${IMAGE_FULL}:${tag}"; do
-              n=$((n + 1)); [ "${n}" -ge 3 ] && exit 1; sleep 15
-            done
-            tag_digest=$(skopeo inspect --format '{{.Digest}}' "docker://${IMAGE_FULL}:${tag}")
-            if [ "${tag_digest}" != "${{ steps.push.outputs.digest }}" ]; then
-              echo "::error::${tag} resolved to ${tag_digest}, not the signed digest ${{ steps.push.outputs.digest }}"
-              exit 1
-            fi
-          done
-          {
-            printf '### Signed container published\n\n'
-            printf 'Digest: `%s@%s`\n\n' "${IMAGE_FULL}" "${{ steps.push.outputs.digest }}"
-            printf 'Promote this exact build with source: `build-%s-%s-%s`\n' \
-              "${{ steps.version.outputs.version }}" "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}"
-          } >> "${GITHUB_STEP_SUMMARY}"
-        env:
-          HAVE_SIGNING_SECRET: ${{ secrets.SIGNING_SECRET != '' }}
-
-  publish_disk:
-    name: Disk image
-    needs: build_push
-    if: >-
-      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging') &&
-      needs.build_push.outputs.channel != '' &&
-      github.event.repository.fork == false
-    permissions:
-      contents: read
-      packages: read
-    uses: ./.github/workflows/build-disk.yml
-    with:
-      tag: ${{ needs.build_push.outputs.tag }}
-      channel: ${{ needs.build_push.outputs.channel }}
-      publish_r2: true
-      image_digest: ${{ needs.build_push.outputs.digest }}
-      source_ref: ${{ needs.build_push.outputs.revision }}
-    secrets:
-      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          name: gamescope-capture-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gamescope-capture/
+          retention-days: 14
+          if-no-files-found: warn
