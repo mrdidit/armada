@@ -363,7 +363,7 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0556-remoteproc-qcom-pas-manage-the-sm8750-soccp.patch`
   source: armada
   upstream: local
-  notes: Fixes one of the two causes of the SM8750 s2idle wake hang (the other is 0044, no longer applied) and lets the 0521 PCIe suspend OPP floor go. The bootloader's early SoCCP image sits in D0 behind the system NoC with no bus vote; the driver reloads soccp.mbn, which parks itself in D3, and the SoC then reaches CX shutdown and DDR low power in suspend. Until the TCSR D-state register shows D3 the driver holds the SoCCP's path to DDR itself, so a board without soccp.mbn (Pocket FIT Elite today) still wakes, without the deeper sleep. Odin 3 firmware: `qcom/sm8750/ayn/odin3/soccp.mbn`, from the device's modem partition.
+  notes: Fixes one of the two causes of the SM8750 s2idle wake hang (the other is 0044, no longer applied) and lets the 0521 PCIe suspend OPP floor go. The bootloader's early SoCCP image sits in D0 behind the system NoC with no bus vote; the driver reloads soccp.mbn, which parks itself in D3, and the SoC then reaches CX shutdown and DDR low power in suspend. Until the TCSR D-state register shows D3 the driver holds the SoCCP's path to DDR itself, so a board without soccp.mbn still wakes, without the deeper sleep. Odin 3 firmware: `qcom/sm8750/ayn/odin3/soccp.mbn`, from the device's modem partition.
 - `patches/0566-soc-qcom-override-the-sm8750-pcie-state-manager-power-control.patch`
   source: armada
   upstream: local
@@ -371,7 +371,7 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0567-soc-qcom-hand-the-sm8750-mdss-to-the-display-sequencer-at-suspend.patch`
   source: armada
   upstream: local
-  notes: The display RSC/CESTA keeps reporting the display active (DISPLAY requestor busy, no AOSS deep sleep) until its CRM software client releases its pass-through votes with the MDSS GDSC under hardware control; then the sequencer collapses the GDSC itself ("mode2"). Replays the downstream display-off handoff at system suspend (after the MDSS, MMCX held) and wakes the sequencer again on resume before msm. Bound by an `armada,sm8750-disp-cesta` node (Odin 3 DTS). With 0566, the Odin 3 reaches AOSS deep sleep for all of s2idle. Writing pass-through votes with the display running stalls the CRM and hangs the next CX collapse, so they are only written with the display suspended.
+  notes: The display RSC/CESTA keeps reporting the display active (DISPLAY requestor busy, no AOSS deep sleep) until its CRM software client releases its pass-through votes with the MDSS GDSC under hardware control; then the sequencer collapses the GDSC itself ("mode2"). Replays the downstream display-off handoff at system suspend (after the MDSS, MMCX held) and wakes the sequencer again on resume before msm. Bound by an `armada,sm8750-disp-cesta` node in the Odin 3 and Pocket FIT Elite DTS patches. Pocket FIT Elite runtime validation is pending. With 0566, the Odin 3 reaches AOSS deep sleep for all of s2idle. Writing pass-through votes with the display running stalls the CRM and hangs the next CX collapse, so they are only written with the display suspended.
 - `patches/0522-PCI-host-common-let-only-endpoints-veto-d3cold.patch`
   source: armada
   upstream: local
@@ -800,7 +800,7 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8750/linux/dts/qcom/sm8750-konkr-pf-elite.dts
 - `dts/sm8750-konkr-pf-elite.dts.patch`
   source: armada
-  notes: Armada adapts the Elite touchscreen node to the full ROCKNIX Chipone fork shared with the SM8650 Pocket FIT, keeps volume-up from waking the system, and adds the DisplayPort playback link required for USB-C DP Alt Mode audio; the touchscreen driver is selected only by those two device-tree nodes. Armada also marks PCIe WAKE# active-low, idles the codec rails in LPM during s2idle, and points the SoCCP remoteproc at the Elite's own firmware. Enables the SM8750 Iris video codec with the inherited SoC resources and default firmware.
+  notes: Armada adapts the Elite touchscreen node to the full ROCKNIX Chipone fork shared with the SM8650 Pocket FIT, keeps volume-up from waking the system, and adds the DisplayPort playback link required for USB-C DP Alt Mode audio; the touchscreen driver is selected only by those two device-tree nodes. Armada also marks PCIe WAKE# active-low, idles the codec rails in LPM during s2idle, and points the SoCCP remoteproc at the Elite's own firmware. Instantiates the display sequencer handoff from 0567 using the shared SM8750 resources and MDSS dependency; runtime sleep validation is pending. Enables the SM8750 Iris video codec with the inherited SoC resources and default firmware.
 - `dts/cq8725s-ayn-common.dtsi`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8750/patches/linux/0046-arm64-dts-qcom-Add-AYN-CQ8725S-Common.patch
   notes: Armada extracted this DTS from the cited ROCKNIX patch and then applied later ROCKNIX DTS updates, including the Odin 3 haptics nodes from ROCKNIX commit `81a31e3d0f`.

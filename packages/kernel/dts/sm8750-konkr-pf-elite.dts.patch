@@ -4,7 +4,8 @@ Subject: [PATCH] arm64: dts: qcom: pocket-fit-elite: configure touch, audio, sle
 Use the full Chipone binding expected by Armada's touchscreen driver,
 remove volume-up as a wakeup source, and add the DisplayPort audio link.
 Enable the SM8750 Iris video codec using its inherited resources and
-default firmware.
+default firmware. Enable the display sequencer handoff from patch 0567
+using the shared SM8750 resources, MMCX domain and MDSS dependency.
 
 diff --git a/arch/arm64/boot/dts/qcom/sm8750-konkr-pf-elite.dts b/arch/arm64/boot/dts/qcom/sm8750-konkr-pf-elite.dts
 index eba9f43..5bb5f29 100644
@@ -88,7 +89,7 @@ index eba9f43..5bb5f29 100644
  	reset-gpios = <&tlmm 102 GPIO_ACTIVE_LOW>;
  
  	wifi@0 {
-@@ -1699,3 +1704,34 @@
+@@ -1699,3 +1704,48 @@
  			"qcom/sm8750/konkr/pfe/cdsp_dtb.mbn";
  	status = "okay";
  };
@@ -122,4 +123,18 @@ index eba9f43..5bb5f29 100644
 +/* Replaces the bootloader's early SoCCP image, which blocks SoC deep sleep */
 +&remoteproc_soccp {
 +	firmware-name = "qcom/sm8750/konkr/pfe/soccp.mbn";
++};
++
++&soc {
++	display-cesta@af20000 {
++		compatible = "armada,sm8750-disp-cesta";
++		reg = <0x0 0x0af20000 0x0 0x1000>,
++		      <0x0 0x0af21000 0x0 0x7000>,
++		      <0x0 0x0af30000 0x0 0x7000>,
++		      <0x0 0x0af09000 0x0 0x8>;
++		reg-names = "rscc", "crm", "wrapper", "gdsc";
++		power-domains = <&rpmhpd RPMHPD_MMCX>;
++		required-opps = <&rpmhpd_opp_low_svs>;
++		armada,mdss = <&mdss>;
++	};
 +};
