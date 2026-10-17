@@ -1,5 +1,5 @@
 From: Armada <noreply@armada.local>
-Subject: [PATCH] arm64: dts: qcom: odin3: enable DPU dithering and codec rail sleep modes
+Subject: [PATCH] arm64: dts: qcom: odin3: enable DPU dithering, codec rail sleep modes, the SoCCP firmware and the display sequencer handoff
 
 --- a/arch/arm64/boot/dts/qcom/cq8725s-ayn-odin3.dts
 +++ b/arch/arm64/boot/dts/qcom/cq8725s-ayn-odin3.dts
@@ -13,7 +13,7 @@ Subject: [PATCH] arm64: dts: qcom: odin3: enable DPU dithering and codec rail sl
  	reset-gpios = <&tlmm 98 GPIO_ACTIVE_LOW>;
  
  	vddio-supply = <&vreg_l12b_1p8>;
-@@ -350,3 +353,39 @@
+@@ -350,3 +353,63 @@
  		};
  	};
  };
@@ -51,5 +51,29 @@ Subject: [PATCH] arm64: dts: qcom: odin3: enable DPU dithering and codec rail sl
 +	regulator-state-mem {
 +		regulator-on-in-suspend;
 +		regulator-mode = <RPMH_REGULATOR_MODE_LPM>;
++	};
++};
++
++/* Replaces the bootloader's early SoCCP image, which blocks SoC deep sleep */
++&remoteproc_soccp {
++	firmware-name = "qcom/sm8750/ayn/odin3/soccp.mbn";
++};
++
++/*
++ * Display sequencer handoff at suspend (0567), so the display reports idle
++ * and the SoC reaches AOSS deep sleep. The last region is the MDSS GDSC
++ * register in dispcc.
++ */
++&soc {
++	display-cesta@af20000 {
++		compatible = "armada,sm8750-disp-cesta";
++		reg = <0x0 0x0af20000 0x0 0x1000>,
++		      <0x0 0x0af21000 0x0 0x7000>,
++		      <0x0 0x0af30000 0x0 0x7000>,
++		      <0x0 0x0af09000 0x0 0x8>;
++		reg-names = "rscc", "crm", "wrapper", "gdsc";
++		power-domains = <&rpmhpd RPMHPD_MMCX>;
++		required-opps = <&rpmhpd_opp_low_svs>;
++		armada,mdss = <&mdss>;
 +	};
 +};
