@@ -88,8 +88,10 @@ jobs:
           [ -z "$need" ] || { sudo apt-get update && sudo apt-get install -y $need; }
 
       - name: Check signing key
+        env:
+          SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
         run: |
-          if [ -z "${{ secrets.SIGNING_SECRET }}" ]; then
+          if [ -z "${SIGNING_SECRET}" ]; then
             echo "::error::SIGNING_SECRET is not set — refusing to publish an unsigned image (devices verify ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }})."
             exit 1
           fi
@@ -172,6 +174,11 @@ jobs:
           buildah info --storage-opt=overlay.mount_program= |
             jq -e '.store.GraphStatus["Native Overlay Diff"] == "true"'
 
+      - name: Authenticate package pulls
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "${REGISTRY_TOKEN}" | buildah login ghcr.io -u "${{ github.actor }}" --password-stdin
+
       - name: Build container image
         id: build_image
         uses: redhat-actions/buildah-build@719e3c40d8af9790c23eca13f7daa339f2867034 # v3.1.0
@@ -233,7 +240,21 @@ jobs:
           # Sign the digest, not a tag (a concurrent run could re-point the tag).
           # --new-bundle-format=false: bootc's verifier expects the legacy .sig; the
           # default flips in cosign v3.
-          cosign sign -y --new-bundle-format=false --key env://COSIGN_PRIVATE_KEY "${IMAGE_REF}"
+          if [ "${IMAGE_FULL}" = "ghcr.io/mrdidit/armada" ]; then
+            umask 077
+            keydir=$(mktemp -d "${RUNNER_TEMP}/mrdidit-signing.XXXXXXXX")
+            trap 'rm -f -- "$keydir/original.pem" "$keydir/imported.key" "$keydir/imported.pub" "$keydir/imported.der" "$keydir/expected.der"; rmdir "$keydir"' EXIT
+            printf '%s\n' "${COSIGN_PRIVATE_KEY}" > "${keydir}/original.pem"
+            unset COSIGN_PRIVATE_KEY
+            cosign import-key-pair --key "${keydir}/original.pem" --output-key-prefix "${keydir}/imported"
+            openssl pkey -pubin -in "${keydir}/imported.pub" -outform DER > "${keydir}/imported.der"
+            openssl pkey -pubin -in system_files/etc/pki/containers/mrdidit-armada.pub -outform DER > "${keydir}/expected.der"
+            cmp "${keydir}/imported.der" "${keydir}/expected.der"
+            cosign sign -y --new-bundle-format=false --key "${keydir}/imported.key" "${IMAGE_REF}"
+            cosign verify --key system_files/etc/pki/containers/mrdidit-armada.pub "${IMAGE_REF}"
+          else
+            cosign sign -y --new-bundle-format=false --key env://COSIGN_PRIVATE_KEY "${IMAGE_REF}"
+          fi
 
           # Legacy-hosted images also need the canonical identity required by bridge policy.
           if [ "${IMAGE_FULL}" = "${ARMADA_LEGACY_IMAGE}" ]; then
@@ -257,6 +278,7 @@ jobs:
           HAVE_SIGNING_SECRET: ${{ secrets.SIGNING_SECRET != '' }}
           TAGS: ${{ steps.push.outputs.digest }}
           COSIGN_EXPERIMENTAL: false
+          COSIGN_PASSWORD: ''
           COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
 
       - name: Publish channel tags

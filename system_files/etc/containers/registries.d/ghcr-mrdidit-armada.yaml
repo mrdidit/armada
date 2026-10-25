@@ -1,0 +1,3 @@
+docker:
+  ghcr.io/mrdidit/armada:
+    use-sigstore-attachments: true
