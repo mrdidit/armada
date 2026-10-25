@@ -1,14 +1,23 @@
 From: Armada <noreply@armada.local>
-Subject: [PATCH] arm64: dts: qcom: pocket-s2: use the dedicated sound card
+Subject: [PATCH] arm64: dts: qcom: pocket-s2: configure sound card and jack polarity
+
+Set normally-closed headphone and ground jack switches for WCD939x.
+Jack polarity change adapted from rafalrojek's Armada PR #663:
+https://github.com/armada-os/armada/pull/663
 
 --- a/arch/arm64/boot/dts/qcom/sm8650-ayaneo-ps2.dts
 +++ b/arch/arm64/boot/dts/qcom/sm8650-ayaneo-ps2.dts
-@@ -12,6 +12,10 @@
+@@ -12,6 +12,15 @@
  	compatible = "ayaneo,pocket-s2", "qcom,sm8650";
  };
  
 +&{/sound} {
 +	compatible = "ayaneo,pocket-s2-sndcard";
++};
++
++&wcd939x {
++	qcom,hphl-jack-type-normally-closed;
++	qcom,ground-jack-type-normally-closed;
 +};
 +
  &i2c4 {
