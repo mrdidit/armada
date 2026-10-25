@@ -6,6 +6,15 @@
     ],
     "transports": {
         "docker": {
+            "ghcr.io/mrdidit/armada": [
+                {
+                    "type": "sigstoreSigned",
+                    "keyPath": "/etc/pki/containers/mrdidit-armada.pub",
+                    "signedIdentity": {
+                        "type": "matchRepository"
+                    }
+                }
+            ],
             "ghcr.io/virtudude/armada": [
                 {
                     "type": "sigstoreSigned",
