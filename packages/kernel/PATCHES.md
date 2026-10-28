@@ -885,7 +885,7 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   notes: Armada keeps volume-up from waking the system, wires the upstream SY7758 driver, marks PCIe WAKE# active-low, idles the codec rails in LPM during s2idle, and keeps the RTC offset in an SDAM cell with the alarm enabled after copying `dts/sm8650-ayaneo-common.dtsi`.
 - `dts/sm8650-ayaneo-ps2.dts.patch`
   source: armada
-  notes: Armada selects the accepted Pocket S2 WSA2 sound-card mapping after copying the ROCKNIX DTS.
+  notes: Selects the Pocket S2 sound-card mapping, normally-closed jack switches from rafalrojek's [PR #663](https://github.com/armada-os/armada/pull/663), and HPH PCM on RX SoundWire port 9. PCM setup is adapted from ovid-io's [PR #803](https://github.com/armada-os/armada/pull/803); port 9 uses block packing 0 and timings captured from stock Pocket S2 Android.
 - `dts/sm8650-konkr-pf.dts.patch`
   source: armada
   notes: Armada selects the shared WSA2 channel mapping through a Pocket FIT-specific sound-card compatible and binds `konkr_sysbtn` to the controller MCU UART, and loads its own ADSP firmware.
