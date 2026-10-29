@@ -698,6 +698,19 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armada
   upstream: not submitted
   notes: Isolated WCD939x ULP stereo test. Skip repeated force-IQ setup when the shared buck supply is already active, preserving per-channel supply references. Based on the Pocket S2 Android startup trace and the Linux helper sequence; distortion causality and mixed headphone/earpiece routes remain unvalidated.
+- `patches/0081b-ASoC-wcd939x-program-Class-H-transport-fields.patch`
+  source: armada
+  upstream: not submitted
+  notes: Based on ovid-io’s analysis in https://github.com/armada-os/armada/pull/803#issuecomment-6481609416 and Pocket S2 Android/Linux captures. Declare the WCD939x Class-H sink FULL so its window and packing fields are programmed. The S2 transport candidate supplies the matching master configuration separately; other WCD939x devices remain untested.
+
+- `patches/0081c-soundwire-qcom-configure-Class-H-master-transport.patch`
+  source: armada
+  upstream: not submitted
+  notes: Optional master-only channel masks and SSP frame periods preserve codec masks and existing controller defaults. PCM/PDM32 formatter shutdown waits until both banks are disabled. Based on the Pocket S2 Android implementation and Qualcomm source; attribution is included in the patch. Runtime transport and distortion validation are pending.
+- `patches/0081d-dt-bindings-soundwire-qcom-describe-master-transport.patch`
+  source: armada
+  upstream: not submitted
+  notes: Documents the optional per-port master masks, SSP frame period and existing PCM/PDM32 formatter mask. S2 selects the new transport settings; other board device trees are unchanged.
 - `patches/0074-soundwire-qcom-PCM-data-port-format-enable.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8750/patches/linux/0074-soundwire-qcom-PCM-data-port-format-enable.patch
   upstream: unknown
@@ -889,7 +902,7 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   notes: Armada keeps volume-up from waking the system, wires the upstream SY7758 driver, marks PCIe WAKE# active-low, idles the codec rails in LPM during s2idle, and keeps the RTC offset in an SDAM cell with the alarm enabled after copying `dts/sm8650-ayaneo-common.dtsi`.
 - `dts/sm8650-ayaneo-ps2.dts.patch`
   source: armada
-  notes: Selects the Pocket S2 sound-card mapping, normally-closed jack switches from rafalrojek's [PR #663](https://github.com/armada-os/armada/pull/663), and HPH PCM on RX SoundWire port 9. PCM setup is adapted from ovid-io's [PR #803](https://github.com/armada-os/armada/pull/803); port 9 uses block packing 0 and timings captured from stock Pocket S2 Android.
+  notes: Selects the Pocket S2 sound-card mapping, normally-closed jack switches from rafalrojek's [PR #663](https://github.com/armada-os/armada/pull/663), and HPH PCM adapted from ovid-io's [PR #803](https://github.com/armada-os/armada/pull/803). The Android reference supplies Class-H master mask 3 with codec mask 1, interval 0x3f, PCM/PDM32 formatter enable, SSP period 6 and headphone port 9 packing 1. Corrects the earlier packing-0 override based on unreliable master readback. Audible results remain unvalidated.
 - `dts/sm8650-konkr-pf.dts.patch`
   source: armada
   notes: Armada selects the shared WSA2 channel mapping through a Pocket FIT-specific sound-card compatible and binds `konkr_sysbtn` to the controller MCU UART, and loads its own ADSP firmware.
