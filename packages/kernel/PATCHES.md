@@ -711,6 +711,14 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armada
   upstream: not submitted
   notes: Documents the optional per-port master masks, SSP frame period and existing PCM/PDM32 formatter mask. S2 selects the new transport settings; other board device trees are unchanged.
+- `patches/0081e-ASoC-wcd939x-initialize-revision-specific-bias-and-RCO.patch`
+  source: Qualcomm Android WCD939x revision initialization; preserved Pocket S2 vendor module and Android/Linux captures.
+  upstream: not submitted
+  notes: Initialize the bias reference and RCO clock for known revisions 1.1 and 2.0 during powered probe, preserving headphone gain. Revision reads and writes are checked; revision 1.0 and unknown IDs receive no new writes. Pocket S2 revision 2.0 reads 0x55 at the bias register with RCO disabled before this change. Audible improvement and other WCD939x devices remain unvalidated.
+- `patches/0081f-ASoC-wcd939x-preserve-PCM-ULP-mode-before-PA-enable.patch`
+  source: Pocket S2 Android WCD939x PA callback audit and active route captures.
+  upstream: not submitted
+  notes: Keep the requested PCM ULP mode before enabling either headphone PA instead of temporarily forcing HiFi. PDM and other modes retain their existing sequence. Shared Class-H control calls, delays and the POST_PMU power-level write are unchanged. Audible improvement remains unvalidated.
 - `patches/0074-soundwire-qcom-PCM-data-port-format-enable.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8750/patches/linux/0074-soundwire-qcom-PCM-data-port-format-enable.patch
   upstream: unknown
