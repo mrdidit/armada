@@ -694,6 +694,10 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0081-ASoC-wcd939x-fix-headphone-analog-volume-controls.patch`
   source: armada
   upstream: local
+- `patches/0081a-ASoC-wcd-clsh-preserve-WCD939x-ULP-startup-state.patch`
+  source: armada
+  upstream: not submitted
+  notes: Isolated WCD939x ULP stereo test. Skip repeated force-IQ setup when the shared buck supply is already active, preserving per-channel supply references. Based on the Pocket S2 Android startup trace and the Linux helper sequence; distortion causality and mixed headphone/earpiece routes remain unvalidated.
 - `patches/0074-soundwire-qcom-PCM-data-port-format-enable.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8750/patches/linux/0074-soundwire-qcom-PCM-data-port-format-enable.patch
   upstream: unknown
