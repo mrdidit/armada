@@ -256,6 +256,11 @@ v2_20260420_neil_armstrong_arm64_qcom_sm8650_misc_enhancements.patch
 0081h-ASoC-wcd939x-sequence-shared-headphone-supplies-once.patch
 0081i-ASoC-wcd939x-sequence-revision-2-impedance-supplies.patch
 0081j-ASoC-wcd939x-manage-jack-leakage-override.patch
+0081k-ASoC-wcd939x-separate-jack-leakage-control.patch
+0081l-ASoC-wcd939x-add-USBSS-jack-measurement-provider.patch
+0081m-ASoC-wcd939x-use-PCM-PA-settling-delays.patch
+0081n-ASoC-wcd-mbhc-drain-workers-before-free.patch
+0081o-dt-bindings-sound-wcd939x-describe-jack-measurement.patch
 0075-ASoC-wsa884x-preserve-Pocket-S2-compander-gain.patch
 0612-ROCKNIX-odin3-q6apm-start-mi2s-port-at-prepare.patch
 0613-ASoC-q6apm-scope-prepare-start-to-MI2S.patch
