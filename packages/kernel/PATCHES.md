@@ -694,10 +694,22 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0081-ASoC-wcd939x-fix-headphone-analog-volume-controls.patch`
   source: armada
   upstream: local
-- `patches/0081a-ASoC-wcd-clsh-preserve-WCD939x-ULP-startup-state.patch`
-  source: armada
+- `patches/0081g-ASoC-wcd939x-align-PCM-headphone-lifecycle.patch`
+  source: Pocket S2 Android WCD939x implementation and Qualcomm source.
   upstream: not submitted
-  notes: Isolated WCD939x ULP stereo test. Skip repeated force-IQ setup when the shared buck supply is already active, preserving per-channel supply references. Based on the Pocket S2 Android startup trace and the Linux helper sequence; distortion causality and mixed headphone/earpiece routes remain unvalidated.
+  notes: Align PCM setup order, per-channel compander shutdown and selected power mode with the retained Android driver. Hardware validation remains pending; SoundWire link recovery is a separate unresolved issue.
+- `patches/0081h-ASoC-wcd939x-sequence-shared-headphone-supplies-once.patch`
+  source: https://github.com/diogotr7/armada/commit/d7896cae0a0f1b957140ec779d609b6d6e0e889d
+  upstream: not submitted
+  notes: Adapt Diogo Trindade's first-start/last-stop Class-H handling while retaining the PCM changes. Replaces the narrower force-IQ-only patch. Mixed headphone/earpiece routes and other WCD939x devices remain untested.
+- `patches/0081i-ASoC-wcd939x-sequence-revision-2-impedance-supplies.patch`
+  source: Pocket S2 Android WCD939x revision-2 impedance callback and Qualcomm source.
+  upstream: not submitted
+  notes: Take and release temporary RX supply ownership around impedance measurement. Checked revision detection excludes other revisions; setup and cleanup errors invalidate the measurement. Hardware validation remains pending.
+- `patches/0081j-ASoC-wcd939x-manage-jack-leakage-override.patch`
+  source: Qualcomm WCD939x/common MBHC source and the Pocket S2 WCD939x callback.
+  upstream: not submitted
+  notes: Manage the leakage pull-up override at boot and jack insertion/removal on integrated USBSS-backed jacks. Published common-driver event ordering is the reference; the installed S2 common MBHC binary was not retained. Hardware validation remains pending.
 - `patches/0081b-ASoC-wcd939x-program-Class-H-transport-fields.patch`
   source: armada
   upstream: not submitted
