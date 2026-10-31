@@ -698,6 +698,14 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: Pocket S2 Android WCD939x implementation and Qualcomm source.
   upstream: not submitted
   notes: Align PCM setup order, per-channel compander shutdown and selected power mode with the retained Android driver. Hardware validation remains pending; SoundWire link recovery is a separate unresolved issue.
+- `patches/0081r-ASoC-wcd939x-handle-SoundWire-cache-recovery-errors.patch`
+  source: Linux 7.2.6 Qualcomm SoundWire cache/initialization patterns and runtime-PM lifecycle APIs.
+  upstream: not submitted
+  notes: Preserve WCD939x cache state across detach and replay errors, check RX/TX initialization, and provide one deferred PM recovery opportunity per successful attachment. Unbind drains recovery work before PM teardown. No stream reconstruction or codec reset; sleep and cold-boot audio behavior remain unvalidated.
+- `patches/0081s-usb-typec-wcd939x-usbss-add-S2-state-recovery.patch`
+  source: Qualcomm USBSS recovery in OnePlusOSS/android_kernel_oneplus_sm8650, `drivers/soc/qcom/wcd939x-i2c.c` Git blob `8effe5ea6a8216bf5db182f673ca02b04a1fd14d`; retained Pocket S2 Android module and periodic-worker captures.
+  upstream: not submitted
+  notes: An S2 quirk enables periodic conditional restoration of Linux-owned USBSS fields and RCO restart. Retains uncached reads, transactional recovery targets and suspend/removal cancellation. USB-C analogue-accessory recovery and Android's full cache/default replay are excluded. Built-in jack recovery and distortion improvement remain unvalidated.
 - `patches/0081h-ASoC-wcd939x-sequence-shared-headphone-supplies-once.patch`
   source: https://github.com/diogotr7/armada/commit/d7896cae0a0f1b957140ec779d609b6d6e0e889d
   upstream: not submitted

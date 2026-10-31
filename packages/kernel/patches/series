@@ -263,6 +263,8 @@ v2_20260420_neil_armstrong_arm64_qcom_sm8650_misc_enhancements.patch
 0081o-dt-bindings-sound-wcd939x-describe-jack-measurement.patch
 0081p-ASoC-wcd939x-coordinate-codec-reset-with-USBSS.patch
 0081q-dt-bindings-sound-wcd939x-describe-reset-coordination.patch
+0081r-ASoC-wcd939x-handle-SoundWire-cache-recovery-errors.patch
+0081s-usb-typec-wcd939x-usbss-add-S2-state-recovery.patch
 0075-ASoC-wsa884x-preserve-Pocket-S2-compander-gain.patch
 0612-ROCKNIX-odin3-q6apm-start-mi2s-port-at-prepare.patch
 0613-ASoC-q6apm-scope-prepare-start-to-MI2S.patch
