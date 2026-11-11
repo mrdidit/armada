@@ -179,6 +179,10 @@ if ! grep -q "# armada-kernel DTBs" "${QCOM_MAKEFILE}" 2>/dev/null; then
     echo "  added $(ls ${DTS_DIR}/*.dts | wc -l) DTB entries"
 fi
 
+# Exercise the opt-in KPFE diagnostic against the actual patched driver source.
+python3 "${REPO_ROOT}/tests/test-kpfe-manual-charge.py" \
+    "${SRC_DIR}/drivers/power/supply/qcom_battmgr.c"
+
 # ---------- 4. Generate config ----------
 # defconfig + fragment via merge_config.sh. Explicit =y requests are checked
 # after Kconfig resolution so a dependency cannot silently demote them to =m.

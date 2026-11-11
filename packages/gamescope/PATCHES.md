@@ -69,3 +69,7 @@ to a commit, or `armada` if it's original; a URL source with no `notes` is verba
 
 - `patches/0034-vulkan-allow-linear-composition-output.patch`
   source: armada
+
+- `patches/0035-pipewire-rework-buffer-sharing-to-be-thread-safe.patch`
+  source: https://github.com/OpenGamingCollective/gamescope/commit/fcee365797177dac3f14749eccfd29e38df6170c
+  notes: Carried from PR #737. The pinned 3.17.0-ogc1 base still uses the older buffer exchange; the patch remains necessary. All affected files apply after the current Armada patches.

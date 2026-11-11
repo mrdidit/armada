@@ -1,5 +1,34 @@
 # Patches
 
+## KPFE preview candidate additions
+
+- `patches/0064a-input-touchscreen-chipone-follow-panel-lifecycle.patch`
+  source: https://github.com/mrdidit/armada/commit/f28b5f644f7537ec7a47509dfcf4e0596de8250d
+  notes: Chipone panel followers, serialized startup/recovery and PM fallback. Current preview has the original vendor driver without equivalent lifecycle handling. KPFE DTS supplies the panel reference.
+- `patches/0670-media-iris-subscribe-encoder-picture-type.patch`
+  source: https://github.com/mrdidit/armada/commit/90258c7bb57f60b71efba0d48115428044ad44a3
+  notes: Encoder output picture-type subscription from PR #737. Current preview still skips encoder subscriptions.
+- `patches/0671-media-iris-gen2-force-keyframe.patch`
+  source: https://lore.kernel.org/all/20260723-dynamic_encode-v4-2-5fd6bd549ead@oss.qualcomm.com/
+  notes: Gen2-only backport from PR #737; upstream attribution and review trailers retained. Current preview lacks the encoder force-keyframe control.
+- `patches/0672-media-iris-serialize-instance-controls.patch`
+  source: https://github.com/mrdidit/armada/commit/90258c7bb57f60b71efba0d48115428044ad44a3
+  notes: Instance/control locking from PR #737. Close-path context refreshed to preserve preview's deferred decoder-work shutdown before clearing the control pointer.
+- `patches/1400-soc-qcom-kpfe-pcie-state-manager-power-control.patch`
+  source: https://github.com/mrdidit/armada/commit/82fe18d819b7f107b99e801a713c7152eac3411b
+  notes: Historical PR #723 PCIe CESTA addition, previously numbered 0566. Restricted to KPFE. Distinct from the retained upstream PCIe power fixes; does not restore old GDSC retention or suspend-floor workarounds. Removed upstream with the optional AOSD additions; restored for this candidate only.
+- `patches/1401-soc-qcom-sm8750-display-sleep-handoff.patch`
+  source: https://github.com/mrdidit/armada/commit/82fe18d819b7f107b99e801a713c7152eac3411b
+  notes: Historical PR #723 display CESTA driver, previously numbered 0567, enabled only by the KPFE DTS addition. Current preview has no equivalent sequencer handoff. Runtime stability and additional power savings on this preview remain unverified.
+- `patches/1402-power-supply-qcom-battmgr-kpfe-manual-charge-rate.patch`
+  source: https://github.com/dxu16/kpfe-charge-limit/blob/cb876c16583e9f57047f61f1df4b2a1ee5d0ebfc/experimental/charge-rate-stop/charge-rate-diagnostic.patch
+  notes: Manual diagnostic only, gated by KPFE compatibility and manual_charge_rate=1. Adds response/state safeguards and blocks competing native percentage/current controls. No automatic percentage policy or property-29 worker. Readback represents an acknowledged request, not measured bypass. See KPFE-PREVIEW-CANDIDATE.md.
+
+The KPFE DTS additionally enables the inherited Iris codec. The video-enc0
+udev alias restores Steam encoder discovery. SoCCP management and firmware,
+PCIe power fixes, audio suspend clock release and MCU suspend power-off remain
+the preview implementations.
+
 Patches applied on top of BASE.env. Each entry's `source` is a URL pinned to a
 commit, or `armada` for original work; a URL source with no `notes` is verbatim.
 `notes` explain modifications or important differences from linked upstream work.
