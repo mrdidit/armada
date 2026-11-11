@@ -92,3 +92,15 @@ python3 packages/kernel/tests/test-kpfe-manual-charge.py /path/to/linux/drivers/
 ```
 
 The kernel build script runs the same check before generating its configuration.
+
+## Build workflow
+
+Fork package pulls use registry authentication. Unchanged packages can reuse
+official artifacts only under the exact package-input hash; resolved artifacts
+are pinned by manifest digest. Changed kernel/Gamescope inputs build in the
+fork. These build adaptations retain the previous fork workflow behavior from
+`c23c8d3` and `30ef88c`; no older package or image baseline is substituted.
+
+The fork image-build workflow is enabled and its `SIGNING_SECRET` is present.
+Secret contents were not inspected. Registry availability and runner execution
+remain build-time checks.

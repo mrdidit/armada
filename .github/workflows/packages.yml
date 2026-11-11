@@ -43,6 +43,7 @@ jobs:
           owner="${{ github.repository_owner }}"
           repo="ghcr.io/${owner,,}/armada/pkg"
           echo "${GH_TOKEN}" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
+          printf '{"auths":{}}\n' > "${RUNNER_TEMP}/upstream-auth.json"
 
           matrix='[]'
           args=""
@@ -59,8 +60,15 @@ jobs:
               *)                            runner=ubuntu-24.04-arm ;;
             esac
 
-            if skopeo inspect --raw "docker://${ref}" >/dev/null 2>&1; then
+            upstream="ghcr.io/armada-os/armada/pkg/${pkg}:${hash}"
+            manifest="${RUNNER_TEMP}/${pkg}-manifest.json"
+            if skopeo inspect --raw "docker://${ref}" > "${manifest}" 2>/dev/null; then
+              ref="${repo}/${pkg}@$(skopeo manifest-digest "${manifest}")"
               echo "::notice::${pkg} already built (${hash})"
+            elif skopeo inspect --authfile "${RUNNER_TEMP}/upstream-auth.json" --raw \
+                "docker://${upstream}" > "${manifest}" 2>/dev/null; then
+              ref="ghcr.io/armada-os/armada/pkg/${pkg}@$(skopeo manifest-digest "${manifest}")"
+              echo "::notice::${pkg} already built upstream (${hash})"
             else
               echo "::notice::${pkg} needs building (${hash})"
               matrix="$(jq -c --arg p "${pkg}" --arg r "${runner}" --arg h "${hash}" \
