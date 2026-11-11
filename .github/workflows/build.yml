@@ -88,8 +88,10 @@ jobs:
           [ -z "$need" ] || { sudo apt-get update && sudo apt-get install -y $need; }
 
       - name: Check signing key
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
         run: |
-          if [ -z "${{ secrets.SIGNING_SECRET }}" ]; then
+          if [ -z "${COSIGN_PRIVATE_KEY}" ]; then
             echo "::error::SIGNING_SECRET is not set — refusing to publish an unsigned image (devices verify ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }})."
             exit 1
           fi
@@ -98,6 +100,17 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: 'v2.6.3'
+
+      - name: Prepare signing key before building
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ""
+        run: bash .github/scripts/prepare-signing-key.sh "${RUNNER_TEMP}/armada-signing"
 
       - name: Install just
         uses: ublue-os/just-action@30ab4659369934b65b655bf8d2fa4ddd6547d384 # v3
@@ -219,14 +232,6 @@ jobs:
           digest=$(skopeo inspect --format '{{.Digest}}' "docker://${IMAGE_FULL}:${BUILD_TAG}")
           echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
 
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        if: env.HAVE_SIGNING_SECRET == 'true'
-        env:
-          HAVE_SIGNING_SECRET: ${{ secrets.SIGNING_SECRET != '' }}
-        with:
-          cosign-release: 'v2.6.3'
-
       - name: Sign container image
         if: env.HAVE_SIGNING_SECRET == 'true'
         run: |
@@ -238,16 +243,17 @@ jobs:
           # Sign the digest, not a tag (a concurrent run could re-point the tag).
           # --new-bundle-format=false: bootc's verifier expects the legacy .sig; the
           # default flips in cosign v3.
-          cosign sign -y --new-bundle-format=false --key env://COSIGN_PRIVATE_KEY "${IMAGE_REF}"
+          cosign sign -y --new-bundle-format=false --key "${RUNNER_TEMP}/armada-signing/cosign.key" "${IMAGE_REF}"
 
           # Legacy-hosted images also need the canonical identity required by bridge policy.
           if [ "${IMAGE_FULL}" = "${ARMADA_LEGACY_IMAGE}" ]; then
             cosign sign -y --new-bundle-format=false \
-              --key env://COSIGN_PRIVATE_KEY \
+              --key "${RUNNER_TEMP}/armada-signing/cosign.key" \
               --sign-container-identity "${ARMADA_CANONICAL_IMAGE}" \
               "${IMAGE_REF}"
           fi
 
+          cosign verify --key "${RUNNER_TEMP}/armada-signing/cosign.pub" "${IMAGE_REF}"
           if [ "${{ github.event.repository.fork }}" != "true" ]; then
             cosign verify --key system_files/etc/pki/containers/armada.pub "${IMAGE_REF}"
             if [ "${IMAGE_FULL}" = "${ARMADA_LEGACY_IMAGE}" ]; then
@@ -262,7 +268,7 @@ jobs:
           HAVE_SIGNING_SECRET: ${{ secrets.SIGNING_SECRET != '' }}
           TAGS: ${{ steps.push.outputs.digest }}
           COSIGN_EXPERIMENTAL: false
-          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ""
 
       - name: Publish channel tags
         if: env.HAVE_SIGNING_SECRET == 'true'
@@ -289,6 +295,13 @@ jobs:
           } >> "${GITHUB_STEP_SUMMARY}"
         env:
           HAVE_SIGNING_SECRET: ${{ secrets.SIGNING_SECRET != '' }}
+
+      - name: Remove temporary signing material
+        if: always()
+        run: |
+          rm -f "${RUNNER_TEMP}/armada-signing/input.pem" \
+                "${RUNNER_TEMP}/armada-signing/cosign.key" \
+                "${RUNNER_TEMP}/armada-signing/cosign.pub"
 
   publish_disk:
     name: Disk image
