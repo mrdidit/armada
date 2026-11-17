@@ -106,12 +106,6 @@ jobs:
         with:
           cosign-release: 'v2.6.3'
 
-      - name: Prepare signing key before building
-        env:
-          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
-          COSIGN_PASSWORD: ""
-        run: bash .github/scripts/prepare-signing-key.sh "${RUNNER_TEMP}/armada-signing"
-
       - name: Install just
         uses: ublue-os/just-action@30ab4659369934b65b655bf8d2fa4ddd6547d384 # v3
 
@@ -216,6 +210,12 @@ jobs:
       - name: Validate Chunkah output
         id: chunkah_output
         run: ./.github/scripts/validate-chunkah-output.sh build
+
+      - name: Prepare signing key after image validation
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ""
+        run: bash .github/scripts/prepare-signing-key.sh "${RUNNER_TEMP}/armada-signing"
 
       - name: Push container to GHCR
         id: push
